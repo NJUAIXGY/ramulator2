@@ -177,8 +177,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       s_write_queue_len += m_write_buffer.size();
       s_priority_queue_len += m_priority_buffer.size();
 
-      // 1. Serve completed reads
-      serve_completed_reads();
+      // 1. Serve completed pending requests (reads and writes)
+      serve_completed_pending();
 
       m_refresh->tick();
 
@@ -209,7 +209,11 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
             req_it->depart = m_clk + m_dram->m_read_latency;
             pending.push_back(*req_it);
           } else if (req_it->type_id == Request::Type::Write) {
-            // TODO: Add code to update statistics
+            // For external simulators, completion callbacks are important.
+            // Model write completion as the point when the final command is issued
+            // (plus 1 cycle) and then call the request callback.
+            req_it->depart = m_clk + 1;
+            pending.push_back(*req_it);
           }
           buffer->remove(req_it);
         } else {
@@ -295,26 +299,27 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
      * It checks the pending queue to see if the top request has received data from DRAM.
      * If so, it finishes this request by calling its callback and poping it from the pending queue.
      */
-    void serve_completed_reads() {
-      if (pending.size()) {
-        // Check the first pending request
-        auto& req = pending[0];
-        if (req.depart <= m_clk) {
-          // Request received data from dram
-          if (req.depart - req.arrive > 1) {
-            // Check if this requests accesses the DRAM or is being forwarded.
-            // TODO add the stats back
-            s_read_latency += req.depart - req.arrive;
-          }
+    void serve_completed_pending() {
+      if (!pending.size()) return;
+      // Check the first pending request
+      auto& req = pending[0];
+      if (req.depart > m_clk) return;
 
-          if (req.callback) {
-            // If the request comes from outside (e.g., processor), call its callback
-            req.callback(req);
-          }
-          // Finally, remove this request from the pending queue
-          pending.pop_front();
+      if (req.type_id == Request::Type::Read) {
+        // Request received data from dram
+        if (req.depart - req.arrive > 1) {
+          // Check if this requests accesses the DRAM or is being forwarded.
+          // TODO add the stats back
+          s_read_latency += req.depart - req.arrive;
         }
-      };
+      }
+
+      if (req.callback) {
+        // If the request comes from outside (e.g., processor), call its callback
+        req.callback(req);
+      }
+      // Finally, remove this request from the pending queue
+      pending.pop_front();
     };
 
 

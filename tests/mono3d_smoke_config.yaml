@@ -1,0 +1,48 @@
+# Minimal smoke config to verify `DRAM.impl: Mono3D` can be instantiated.
+#
+# Run:
+#   cmake --build third_party/ramulator2/build_local -j
+#   third_party/ramulator2/build_local/ramulator2 -f third_party/ramulator2/tests/mono3d_smoke_config.yaml
+#
+# Notes:
+# - GEM5 frontend finishes immediately; this is an instantiation/config sanity test.
+# - For Accel-Sim shmem backend usage, see:
+#   third_party/ramulator2/docs/accelsim_shmem_mono3d_model.md
+
+Frontend:
+  impl: GEM5
+  clock_ratio: 1
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 1
+
+  DRAM:
+    impl: Mono3D
+    org:
+      channel_width: 256          # bits (32B transaction when prefetch_size=1)
+      prefetch_size: 1
+      channel: 1                  # scheme-1: layer -> channel
+      rank: 1
+      bankgroup: 1
+      bank: 8
+      row: 1024
+      column: 256
+      dq: 256
+    timing:
+      preset: Mono3D_Default
+
+  Controller:
+    impl: BankParallel
+    bank_parallel_ports_per_layer: 4
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: None
+    RowPolicy:
+      impl: OpenRowPolicy
+    plugins:
+
+  AddrMapper:
+    impl: RoBaRaCoCh
+
