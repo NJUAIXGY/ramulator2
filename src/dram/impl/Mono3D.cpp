@@ -146,8 +146,11 @@ class Mono3D : public IDRAM, public Implementation {
   void tick() override { m_clk++; }
 
   void init() override {
-    RAMULATOR_DECLARE_SPECS();
     set_organization();
+    // Mono3D allows YAML to override org.prefetch_size. We must declare specs
+    // after reading organization parameters so the base IDRAM fields reflect
+    // the configured prefetch size (tx_bytes derivation, addr mapping, etc.).
+    RAMULATOR_DECLARE_SPECS();
     set_timing_vals();
 
     set_actions();
@@ -454,4 +457,3 @@ class Mono3D : public IDRAM, public Implementation {
 };
 
 }  // namespace Ramulator
-
