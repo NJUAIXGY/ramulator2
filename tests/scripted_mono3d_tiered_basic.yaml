@@ -1,0 +1,63 @@
+# Functional smoke test for `DRAM.impl: Mono3DTiered`.
+#
+# Intent:
+# - Verify the new tiered organization can accept and complete real requests.
+# - The second read bumps the address into the next tier field under `RoBaRaCoCh`.
+# - Keep the controller unchanged (`BankParallel`) so this test stays focused on
+#   stage-B organization semantics rather than future vertical/shared resources.
+#
+# Run:
+#   third_party/ramulator2/build/ramulator2 -f third_party/ramulator2/tests/scripted_mono3d_tiered_basic.yaml
+
+Frontend:
+  impl: Scripted
+  clock_ratio: 1
+  max_cycles: 200
+  script:
+    - { type: read, addr: 0x0, at: 0 }
+    - { type: read, addr: 0x2000, at: 1 }
+  expectations:
+    - { kind: order, before: 0, after: 1 }
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 1
+
+  DRAM:
+    impl: Mono3DTiered
+    org:
+      channel_width: 256
+      prefetch_size: 1
+      channel: 1
+      tier: 4
+      bankgroup: 1
+      bank: 8
+      row: 256
+      column: 256
+      dq: 256
+    timing:
+      preset: Mono3DTiered_Default
+      nCL: 4
+      nRCD: 2
+      nRP: 2
+      nRAS: 4
+      nRC: 6
+      nRTP: 2
+      nWR: 2
+      nCWL: 4
+      nWTR: 2
+      nRTW: 2
+
+  Controller:
+    impl: BankParallel
+    cmd_issue_width_per_layer: 2
+    access_ports_per_layer: 1
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: None
+    RowPolicy:
+      impl: OpenRowPolicy
+
+  AddrMapper:
+    impl: RoBaRaCoCh

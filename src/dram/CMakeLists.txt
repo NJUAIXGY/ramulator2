@@ -18,6 +18,7 @@ target_sources(
   impl/HBM2.cpp
   impl/HBM3.cpp
   impl/Mono3D.cpp
+  impl/Mono3DTiered.cpp
 )
 
 target_link_libraries(

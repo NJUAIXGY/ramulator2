@@ -9,11 +9,16 @@ target_sources(
   plugin.h
   refresh.h
   rowpolicy.h
+  bank_machine.h
+  bank_machine.cpp
+  bank_state_scoreboard.h
+  bank_state_scoreboard.cpp
 
   impl/bh_dram_controller.cpp
   impl/dummy_controller.cpp
   impl/generic_dram_controller.cpp
   impl/bank_parallel_dram_controller.cpp
+  impl/tiered_m3d_dram_controller.cpp
   impl/prac_dram_controller.cpp
   
   impl/scheduler/bh_scheduler.cpp

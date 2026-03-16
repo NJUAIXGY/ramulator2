@@ -1,9 +1,11 @@
 #ifndef     RAMULATOR_BASE_REQUEST_H
 #define     RAMULATOR_BASE_REQUEST_H
 
-#include <vector>
+#include <array>
+#include <cstdint>
 #include <list>
 #include <string>
+#include <vector>
 
 #include "base/base.h"
 
@@ -25,6 +27,22 @@ struct Request {
   int type_id = -1;    // An identifier for the type of the request
   int source_id = -1;  // An identifier for where the request is coming from (e.g., which core)
 
+  // Optional semantic contract for tiered/3D backends.
+  struct PathClass {
+    enum : int {
+      Unknown = 0,
+      LocalAccess,
+      CrossTierAccess,
+      VerticalCopy,
+    };
+  };
+
+  int path_class = PathClass::Unknown;  // Optional path semantic from the producer.
+  uint32_t request_size_bytes = 0;      // Optional producer-visible payload size.
+  int source_tier_hint = -1;            // Optional producer-visible source tier.
+  int destination_tier_hint = -1;       // Optional producer-visible destination tier.
+  int tier_hint = -1;                   // Legacy alias for destination_tier_hint.
+
   int command = -1;          // The command that need to be issued to progress the request
   int final_command = -1;    // The final command that is needed to finish the request
   bool is_stat_updated = false; // Memory controller stats
@@ -32,7 +50,7 @@ struct Request {
   Clk_t arrive = -1;   // Clock cycle when the request arrive at the memory controller
   Clk_t depart = -1;   // Clock cycle when the request depart the memory controller
 
-  std::array<int, 4> scratchpad = { 0 };    // A scratchpad for the request
+  std::array<int, 12> scratchpad = { 0 };   // Scratchpad for scheduler/controller metadata
 
   std::function<void(Request&)> callback;
 
@@ -57,7 +75,7 @@ struct ReqBuffer {
   size_t size() const { return buffer.size(); }
 
   bool enqueue(const Request& request) {
-    if (buffer.size() <= max_size) {
+    if (buffer.size() < max_size) {
       buffer.push_back(request);
       return true;
     } else {

@@ -1,0 +1,97 @@
+# Functional control test for the minimal vertical-path model.
+#
+# Expected behavior:
+# - Use the same remote-tier row-hit setup as `scripted_tiered_m3d_vertical_port.yaml`.
+# - Keep shared and per-tier budgets at 2/1.
+# - Disable vertical-path throttling with `vertical_transfer_ports: 0`.
+# - The two remote-tier row-hit reads should now complete in the same cycle.
+
+Frontend:
+  impl: Scripted
+  clock_ratio: 1
+  max_cycles: 5000
+  script:
+    - type: read
+      addr: 0x2000
+      size: 64
+      path_class: cross_tier
+      tier_hint: 1
+      at: 0
+    - type: read
+      addr: 0x4000
+      size: 64
+      path_class: cross_tier
+      tier_hint: 2
+      at: 1
+    - type: read
+      addr: 0x2000
+      size: 64
+      path_class: cross_tier
+      tier_hint: 1
+      at: 20
+    - type: read
+      addr: 0x4000
+      size: 64
+      path_class: cross_tier
+      tier_hint: 2
+      at: 20
+  expectations:
+    - kind: same_done_cycle
+      a: 2
+      b: 3
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 1
+
+  DRAM:
+    impl: Mono3DTiered
+    org:
+      channel_width: 256
+      prefetch_size: 1
+      channel: 1
+      tier: 4
+      bankgroup: 1
+      bank: 8
+      row: 256
+      column: 256
+      dq: 256
+    timing:
+      preset: Mono3DTiered_Default
+      tCK_ps: 2500
+      nBL: 0
+      nCL: 4
+      nCWL: 4
+      nRCD: 2
+      nRTP: 2
+      nWR: 2
+      nRAS: 4
+      nRP: 2
+      nRC: 6
+      nWTR: 0
+      nRTW: 0
+      nCCDS: 0
+      nRRDS: 0
+      nFAW: 0
+
+  Controller:
+    impl: TieredM3D
+    write_completion_mode: posted
+    cmd_issue_width_per_channel: 4
+    shared_access_ports_per_channel: 2
+    tier_access_ports: 1
+    vertical_transfer_ports: 0
+    active_buffer_max_size: 128
+    read_buffer_max_size: 128
+    write_buffer_max_size: 128
+    priority_buffer_max_size: 128
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: None
+    RowPolicy:
+      impl: OpenRowPolicy
+    plugins:
+
+  AddrMapper:
+    impl: RoBaRaCoCh

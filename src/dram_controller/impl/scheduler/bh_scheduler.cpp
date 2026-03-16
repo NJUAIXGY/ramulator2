@@ -10,7 +10,7 @@ class BHScheduler : public IBHScheduler, public Implementation {
   RAMULATOR_REGISTER_IMPLEMENTATION(IBHScheduler, BHScheduler, "BHScheduler", "BHammer Scheduler.")
 
   private:
-    IDRAM* m_dram;
+    IDRAMController* m_ctrl = nullptr;
 
     int m_clk = -1;
 
@@ -21,12 +21,12 @@ class BHScheduler : public IBHScheduler, public Implementation {
     }
 
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
-      m_dram = cast_parent<IDRAMController>()->m_dram;
+      m_ctrl = cast_parent<IDRAMController>();
     }
 
     ReqBuffer::iterator compare(ReqBuffer::iterator req1, ReqBuffer::iterator req2) override {
-      bool ready1 = m_dram->check_ready(req1->command, req1->addr_vec);
-      bool ready2 = m_dram->check_ready(req2->command, req2->addr_vec);
+      bool ready1 = m_ctrl->is_command_ready(req1->command, req1->addr_vec);
+      bool ready2 = m_ctrl->is_command_ready(req2->command, req2->addr_vec);
 
       if (ready1 ^ ready2) {
         if (ready1) {
@@ -50,7 +50,7 @@ class BHScheduler : public IBHScheduler, public Implementation {
       }
 
       for (auto& req : buffer) {
-        req.command = m_dram->get_preq_command(req.final_command, req.addr_vec);
+        req.command = m_ctrl->get_prereq_command(req.final_command, req.addr_vec);
       }
 
       auto candidate = buffer.begin();

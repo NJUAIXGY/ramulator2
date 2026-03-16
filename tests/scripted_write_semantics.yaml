@@ -1,0 +1,77 @@
+# Functional test: write completion uses data-return latency and pending queue
+# does not suffer head-of-line blocking.
+#
+# Expected behavior:
+# - Issue a read first, then a write.
+# - Configure nCL > nCWL so read latency > write latency.
+# - Write must complete before read; otherwise either write completion semantics
+#   are wrong or pending completion is HOL-blocked.
+
+Frontend:
+  impl: Scripted
+  clock_ratio: 1
+  max_cycles: 2000
+  script:
+    - type: read
+      addr: 0x0000
+      at: 0
+    - type: write
+      addr: 0x1000
+      at: 1
+  expectations:
+    - kind: order
+      before: 1   # write
+      after: 0    # read
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 1
+
+  DRAM:
+    impl: Mono3D
+    org:
+      channel_width: 256
+      prefetch_size: 2
+      channel: 1
+      rank: 1
+      bankgroup: 1
+      bank: 16
+      row: 256
+      column: 256
+      dq: 256
+    timing:
+      preset: Mono3D_Default
+      tCK_ps: 2500
+      nBL: 1
+      nCL: 20
+      nCWL: 2
+      nRCD: 2
+      nRTP: 2
+      nWR: 2
+      nRAS: 4
+      nRP: 2
+      nRC: 6
+      nWTR: 2
+      nRTW: 2
+
+  Controller:
+    impl: BankParallel
+    write_completion_mode: data
+    cmd_issue_width_per_layer: 2
+    access_ports_per_layer: 2
+    bank_parallel_ports_per_layer: 2
+    active_buffer_max_size: 128
+    read_buffer_max_size: 128
+    write_buffer_max_size: 128
+    priority_buffer_max_size: 128
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: None
+    RowPolicy:
+      impl: OpenRowPolicy
+    plugins:
+
+  AddrMapper:
+    impl: RoBaRaCoCh
+

@@ -1,0 +1,82 @@
+# Functional test: foreground traffic should outrun same-cycle background traffic
+# when both are row-hits and access_ports_per_layer=1.
+
+Frontend:
+  impl: Scripted
+  clock_ratio: 1
+  max_cycles: 5000
+  script:
+    - type: read
+      addr: 0x0000
+      at: 0
+    - type: read
+      addr: 0x2000
+      at: 1
+    - type: read
+      addr: 0x0000
+      at: 20
+      traffic_class: background
+    - type: read
+      addr: 0x2000
+      at: 20
+      traffic_class: foreground
+  expectations:
+    - kind: order
+      before: 3
+      after: 2
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 1
+
+  DRAM:
+    impl: Mono3D
+    org:
+      channel_width: 256
+      prefetch_size: 2
+      channel: 1
+      rank: 1
+      bankgroup: 1
+      bank: 16
+      row: 256
+      column: 256
+      dq: 256
+    timing:
+      preset: Mono3D_Default
+      tCK_ps: 2500
+      nBL: 1
+      nCL: 4
+      nCWL: 4
+      nRCD: 2
+      nRTP: 2
+      nWR: 2
+      nRAS: 4
+      nRP: 2
+      nRC: 6
+      nWTR: 2
+      nRTW: 2
+
+  Controller:
+    impl: BankParallel
+    write_completion_mode: posted
+    cmd_issue_width_per_layer: 4
+    access_ports_per_layer: 1
+    bank_parallel_ports_per_layer: 4
+    qos_enable: true
+    qos_background_cmd_budget_per_cycle: 1
+    qos_shadow_cmd_budget_per_cycle: 1
+    qos_non_foreground_starvation_threshold_cycles: 64
+    active_buffer_max_size: 128
+    read_buffer_max_size: 128
+    write_buffer_max_size: 128
+    priority_buffer_max_size: 128
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: None
+    RowPolicy:
+      impl: OpenRowPolicy
+    plugins:
+
+  AddrMapper:
+    impl: RoBaRaCoCh

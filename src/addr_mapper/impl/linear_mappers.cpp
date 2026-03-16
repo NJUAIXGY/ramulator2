@@ -28,13 +28,56 @@ class LinearMapperBase : public IAddrMapper {
       m_num_levels = count.size();
       m_addr_bits.resize(m_num_levels);
       for (size_t level = 0; level < m_addr_bits.size(); level++) {
+        const int c = count[level];
+        if (c <= 0) {
+          throw std::runtime_error(fmt::format(
+              "Invalid DRAM organization: org.{} must be positive (got {}).",
+              m_dram->m_levels((int)level), c));
+        }
+        // Linear mappers bit-slice addresses by log2(count). Non-powers-of-two
+        // would silently alias and break bank/row/col semantics.
+        const uint64_t cc = (uint64_t)c;
+        if ((cc & (cc - 1)) != 0) {
+          throw std::runtime_error(fmt::format(
+              "Invalid DRAM organization: org.{} must be a power of two for "
+              "linear address mapping (got {}).",
+              m_dram->m_levels((int)level), c));
+        }
         m_addr_bits[level] = calc_log2(count[level]);
       }
 
       // Last (Column) address have the granularity of the prefetch size
+      const int prefetch = m_dram->m_internal_prefetch_size;
+      if (prefetch <= 0) {
+        throw std::runtime_error("Invalid DRAM organization: prefetch_size must be positive.");
+      }
+      const uint64_t p = (uint64_t)prefetch;
+      if ((p & (p - 1)) != 0) {
+        throw std::runtime_error(
+            "Invalid DRAM organization: prefetch_size must be a power of two for linear address mapping.");
+      }
       m_addr_bits[m_num_levels - 1] -= calc_log2(m_dram->m_internal_prefetch_size);
 
-      int tx_bytes = m_dram->m_internal_prefetch_size * m_dram->m_channel_width / 8;
+      if (m_dram->m_channel_width <= 0 || (m_dram->m_channel_width % 8) != 0) {
+        throw std::runtime_error(
+            "Invalid DRAM organization: channel_width must be a positive multiple of 8 (bits).");
+      }
+      const uint64_t tx_bytes_u64 =
+          (uint64_t)m_dram->m_internal_prefetch_size * (uint64_t)m_dram->m_channel_width / 8ull;
+      if (tx_bytes_u64 == 0) {
+        throw std::runtime_error("Invalid DRAM organization: tx_bytes must be positive.");
+      }
+      if ((tx_bytes_u64 & (tx_bytes_u64 - 1)) != 0) {
+        throw std::runtime_error(
+            "Invalid DRAM organization: tx_bytes (prefetch_size*channel_width/8) must be a power of two for linear address mapping.");
+      }
+      const int col_count = count.empty() ? 0 : count.back();
+      if (col_count > 0 && (col_count % prefetch) != 0) {
+        throw std::runtime_error(
+            "Invalid DRAM organization: org.column must be a multiple of prefetch_size.");
+      }
+
+      int tx_bytes = (int)tx_bytes_u64;
       m_tx_offset = calc_log2(tx_bytes);
 
       // Determine where are the row and col bits for ChRaBaRoCo and RoBaRaCoCh

@@ -63,7 +63,8 @@ public:
             return;
         }
 
-        if (req_it->source_id < 0) {
+        if (req_it->source_id < 0 ||
+            static_cast<size_t>(req_it->source_id) >= m_blacklist_info.size()) {
             return;
         }
         
@@ -87,7 +88,10 @@ public:
     }
 
     virtual bool is_blacklisted(int source_id) override {
-        return source_id < 0 || m_blacklist_info[source_id];
+        if (source_id < 0 || static_cast<size_t>(source_id) >= m_blacklist_info.size()) {
+            return false;
+        }
+        return m_blacklist_info[source_id];
     }
 };      // class BLISS
 

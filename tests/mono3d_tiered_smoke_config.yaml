@@ -1,0 +1,47 @@
+# Minimal smoke config to verify `DRAM.impl: Mono3DTiered` can be instantiated.
+#
+# Run:
+#   cmake --build third_party/ramulator2/build -j
+#   third_party/ramulator2/build/ramulator2 -f third_party/ramulator2/tests/mono3d_tiered_smoke_config.yaml
+#
+# Notes:
+# - This is an organization-semantics smoke test for stage-B (`tier-inside-channel`).
+# - It intentionally reuses the existing BankParallel controller; tier-aware
+#   shared/vertical resource modeling is deferred to the next controller stage.
+
+Frontend:
+  impl: GEM5
+  clock_ratio: 1
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 1
+
+  DRAM:
+    impl: Mono3DTiered
+    org:
+      channel_width: 256          # bits (32B transaction when prefetch_size=1)
+      prefetch_size: 1
+      channel: 1                  # host-visible channels
+      tier: 4                     # internal tiers within the channel
+      bankgroup: 1
+      bank: 8
+      row: 256
+      column: 256
+      dq: 256
+    timing:
+      preset: Mono3DTiered_Default
+
+  Controller:
+    impl: BankParallel
+    bank_parallel_ports_per_layer: 4
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: None
+    RowPolicy:
+      impl: OpenRowPolicy
+    plugins:
+
+  AddrMapper:
+    impl: RoBaRaCoCh

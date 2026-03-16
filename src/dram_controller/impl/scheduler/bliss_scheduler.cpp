@@ -11,6 +11,7 @@ class BLISSScheduler : public IBHScheduler, public Implementation {
   RAMULATOR_REGISTER_IMPLEMENTATION(IBHScheduler, BLISSScheduler, "BLISS", "BLISS Scheduler.")
 
   private:
+    IBHDRAMController* m_ctrl = nullptr;
     IDRAM* m_dram;
     IBLISS* m_bliss;
 
@@ -28,9 +29,9 @@ class BLISSScheduler : public IBHScheduler, public Implementation {
     void init() override { }
 
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
-      auto* ctrl = cast_parent<IBHDRAMController>();
-      m_dram = ctrl->m_dram;
-      m_bliss = ctrl->get_plugin<IBLISS>();
+      m_ctrl = cast_parent<IBHDRAMController>();
+      m_dram = m_ctrl->m_dram;
+      m_bliss = m_ctrl->get_plugin<IBLISS>();
 
       m_req_rd = m_dram->m_requests("read");
       m_req_wr = m_dram->m_requests("write");
@@ -77,7 +78,7 @@ class BLISSScheduler : public IBHScheduler, public Implementation {
       }
 
       for (auto& req : buffer) {
-        req.command = m_dram->get_preq_command(req.final_command, req.addr_vec);
+        req.command = m_ctrl->get_prereq_command(req.final_command, req.addr_vec);
 
         // Check if the request is safe to issue
         bool blisted = m_bliss->is_blacklisted(req.source_id);
@@ -86,7 +87,7 @@ class BLISSScheduler : public IBHScheduler, public Implementation {
         req.scratchpad[SAFE_IDX] = safe;
         
         // Check if the request is ready
-        bool ready = m_dram->check_ready(req.command, req.addr_vec);
+        bool ready = m_ctrl->is_command_ready(req.command, req.addr_vec);
         req.scratchpad[READY_IDX] = ready;
       }
 
@@ -103,4 +104,3 @@ class BLISSScheduler : public IBHScheduler, public Implementation {
 };
 
 }       // namespace Ramulator
-

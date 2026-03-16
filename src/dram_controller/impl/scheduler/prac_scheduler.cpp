@@ -11,7 +11,6 @@ class PRACScheduler : public IBHScheduler, public Implementation {
 RAMULATOR_REGISTER_IMPLEMENTATION(IBHScheduler, PRACScheduler, "PRACScheduler", "PRAC Scheduler.")
 
 private:
-    IDRAM* m_dram;
     IBHDRAMController* m_ctrl;
     IPRAC* m_prac;
 
@@ -31,7 +30,6 @@ public:
 
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
         m_ctrl = cast_parent<IBHDRAMController>();
-        m_dram = m_ctrl->m_dram;
         m_prac = m_ctrl->get_plugin<IPRAC>();
 
         if (!m_prac) {
@@ -80,9 +78,9 @@ public:
 
         Clk_t next_recovery = m_prac->next_recovery_cycle();
         for (auto& req : buffer) {
-            req.command = m_dram->get_preq_command(req.final_command, req.addr_vec);
+            req.command = m_ctrl->get_prereq_command(req.final_command, req.addr_vec);
             req.scratchpad[FITS_IDX] = m_clk + m_prac->min_cycles_with_preall(req) < next_recovery;
-            req.scratchpad[READY_IDX] = m_dram->check_ready(req.command, req.addr_vec);
+            req.scratchpad[READY_IDX] = m_ctrl->is_command_ready(req.command, req.addr_vec);
         }
 
         auto candidate = buffer.begin();

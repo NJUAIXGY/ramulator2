@@ -17,6 +17,24 @@
 
 namespace Ramulator {
 
+enum class ControllerRefreshMode : int {
+  kUnknown = 0,
+  kStaticNormal = 1,
+};
+
+struct ControllerTelemetry {
+  bool valid = false;
+  int rowbuffer_state = 0;
+  bool bank_busy = false;
+  bool refreshing = false;
+  uint64_t refresh_horizon_cycles = 0;
+  uint64_t queue_occupancy = 0;
+  uint64_t queue_capacity = 0;
+  uint32_t queue_pressure_permille = 0;
+  uint64_t refresh_epoch = 0;
+  ControllerRefreshMode refresh_mode = ControllerRefreshMode::kUnknown;
+};
+
 class IDRAMController : public Clocked<IDRAMController> {
   RAMULATOR_REGISTER_INTERFACE(IDRAMController, "Controller", "Memory Controller Interface");
 
@@ -49,6 +67,56 @@ class IDRAMController : public Clocked<IDRAMController> {
      * 
      */
     virtual void tick() = 0;
+
+    /**
+     * @brief       Optional controller-owned prerequisite command resolution.
+     *
+     * @details
+     * Default behavior delegates to DRAM device model (legacy Ramulator2 flow).
+     * Controllers that maintain explicit bank/row state (e.g., scoreboard) can
+     * override this to become the single source of truth for prereq selection.
+     */
+    virtual int get_prereq_command(int final_command,
+                                   const AddrVec_t& addr_vec) const {
+      if (!m_dram) return -1;
+      return m_dram->get_preq_command(final_command, addr_vec);
+    }
+
+    /**
+     * @brief       Optional controller-owned command readiness check.
+     *
+     * @details
+     * Default behavior delegates to DRAM device model (legacy Ramulator2 flow).
+     * Controllers that maintain explicit timing state can override this to
+     * become the single source of truth for readiness decisions.
+     */
+    virtual bool is_command_ready(int command, const AddrVec_t& addr_vec) const {
+      if (!m_dram) return false;
+      return m_dram->check_ready(command, addr_vec);
+    }
+
+    /**
+     * @brief       Optional row-buffer probe at controller level.
+     *
+     * @details
+     * Returns true if the controller can answer the probe. `result` follows:
+     *   0 = closed / unavailable, 1 = row hit, 2 = row open conflict.
+     */
+    virtual bool probe_rowbuffer(int final_command, const AddrVec_t& addr_vec,
+                                 int& result) const {
+      (void)final_command;
+      (void)addr_vec;
+      result = 0;
+      return false;
+    }
+
+    virtual bool query_telemetry(int final_command, const AddrVec_t& addr_vec,
+                                 ControllerTelemetry& result) const {
+      (void)final_command;
+      (void)addr_vec;
+      result = ControllerTelemetry {};
+      return false;
+    }
    
 };
 

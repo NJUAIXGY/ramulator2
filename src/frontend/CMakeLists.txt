@@ -18,6 +18,7 @@ target_sources(
 
   impl/external_wrapper/gem5_frontend.cpp
   impl/external_wrapper/sst_frontend.cpp
+  impl/external_wrapper/scripted_frontend.cpp
 )
 
 target_link_libraries(

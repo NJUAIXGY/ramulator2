@@ -2,7 +2,7 @@
 
 > 目的：本文档描述**目前已经实现**的“3D 堆叠 DRAM shared memory（v0）”在 Ramulator2 中的表达方式、上层 Accel-Sim 的调用方式、关键参数与统计口径，方便主人在上层做配置/对接与结果解读喵～ (..•˘_˘•..)
 
-> 一句话总结：当前已提供 `DRAM.impl: Mono3D`（v1）设备模型，并与 **`GenericDRAMSystem + BankParallel 控制器`** 组合用于 Accel-Sim shared-memory 近存建模；`layer -> channel`、`bank_parallel_ports_per_layer`、row buffer 统计口径与 v0 保持一致，区别在于 DRAM 设备/timing 不再使用 DDR4 占位。
+> 一句话总结：当前已提供 `DRAM.impl: Mono3D`（v1）设备模型，并与 **`GenericDRAMSystem + BankParallel 控制器`** 组合用于 Accel-Sim shared-memory 近存建模；`layer -> channel`、row buffer 统计口径与 v0 保持一致。BankParallel 的并行度从 v0 的单旋钮 `bank_parallel_ports_per_layer` 拆分为 `cmd_issue_width_per_layer`（总发射宽度）+ `access_ports_per_layer`（访问端口/数据口），并提供 `write_completion_mode`（posted/data）以解释写路径完成语义。当前 `Mono3D` 还补上了最小 `PREA + REFab` / `nRFC + nREFI` 支持，可用于 controller refresh 生命周期闭环验证。
 
 ## 1. 总体抽象与建模边界
 
@@ -28,7 +28,10 @@
 
 - **一个 layer 对应 Ramulator2 的一个 channel**；
 - 因此 `DRAM.org.channel = layer_count`；
-- `BankParallel` 的 `bank_parallel_ports_per_layer = P` 代表**每个 layer（每个 channel）每周期最多并行推进 P 个 bank 的访问命令**（详见 3.2）。
+- `BankParallel` 的并行度在 v1 中建议使用两个旋钮（详见 3.2）：
+  - `cmd_issue_width_per_layer = W`：每个 layer（每个 channel）每周期最多 issue 的命令条数（总发射宽度）。
+  - `access_ports_per_layer = A`：每周期最多 issue 的访问类命令（RD/WR/RDA/WRA）条数，并额外要求访问落在不同 bank。
+  - 兼容：如果 YAML 里只写了旧字段 `bank_parallel_ports_per_layer = P`，则默认 `W=A=P`。
 
 > 重要：当前在 Accel-Sim shared-memory backend 的用法里通常是“每个 SM 一个 Ramulator2 memory system 实例”，因此不同 SM 间不会互相争用该 Mono3D shared memory（这符合“贴近 SM”的近存假设）。
 
@@ -45,7 +48,7 @@ GPGPU-Sim shared-memory 访问
           -> MemorySystem: GenericDRAMSystem
               -> AddrMapper: 把物理地址映射为 addr_vec(levels)
               -> Controller[channel]: BankParallel (每个 channel/layer 一个)
-                  -> DRAM device model: DDR4 / (未来 Mono3D)
+                  -> DRAM device model: Mono3D (可替换为其它 DRAM impl)
 ```
 
 关键实现文件：
@@ -79,11 +82,14 @@ GPGPU-Sim shared-memory 访问
 - MemorySystem：`MemorySystem.impl: GenericDRAM`（`third_party/ramulator2/src/memory_system/impl/generic_DRAM_system.cpp`）
   - 每个 `channel` 创建一个 controller 实例（controller 的 `id` 会标记为 `Channel i`）。
 - Controller：`Controller.impl: BankParallel`（新增，`third_party/ramulator2/src/dram_controller/impl/bank_parallel_dram_controller.cpp`）
-  - **每个 tick 最多 issue `P` 条命令**（`P = bank_parallel_ports_per_layer`）。
-  - 在同一 tick 内，对 “访问类命令”（`is_accessing`，一般对应 RD/WR）施加 “**同一 bank 只能被访问一次**” 的并行约束。
+  - **每个 tick 最多 issue `W` 条命令**（`W = cmd_issue_width_per_layer`，默认回退到 `bank_parallel_ports_per_layer`）。
+  - 在同一 tick 内，对 “访问类命令”（`is_accessing`，一般对应 RD/WR/RDA/WRA）施加两类并行约束：
+    - **访问端口数上限**：最多 issue `A = access_ports_per_layer` 条访问类命令（默认回退到 `bank_parallel_ports_per_layer`）。
+    - **同一 bank 只能被访问一次**：同一 tick 内禁止向同一 bank 并行 issue 多个访问类命令。
   - 其它行为（read/write buffer、write-mode 切换、水位线、scheduler/rowpolicy/refresh/plugin 调用顺序、row hit/conflict 统计口径）基本沿用 Generic controller 的结构。
 - DRAM 设备模型：`DRAM.impl: Mono3D`（新增，`third_party/ramulator2/src/dram/impl/Mono3D.cpp`）
   - 含义：row buffer 行状态、ACT/RD/WR/PRE 的时序与约束来自 Mono3D；可通过 YAML 的 `org`/`timing` 覆盖参数。
+  - 当前还支持最小 all-bank refresh 路径（`PREA/REFab/REFab_end` + `nRFC/nREFI`），验证配置见 `third_party/ramulator2/tests/scripted_mono3d_refresh_lifecycle.yaml`。
 - Frontend（Accel-Sim 场景）：强制使用 `Frontend.impl: GEM5`（external request wrapper）
   - 这是 `gpu-simulator/gpgpu-sim/src/gpgpu-sim/shmem_backend_ramulator2.cc` 在 real-mode 下固定创建的 frontend，用于接收上层外部请求。
 
@@ -92,7 +98,7 @@ GPGPU-Sim shared-memory 访问
 已建模（对主人上层最重要的部分）：
 
 - Layer 并行：通过 `channel = layer` 映射实现（只要地址映射能把请求分散到不同 channel，就能并行推进多个 layer）。
-- Bank 级并行上限：用 `bank_parallel_ports_per_layer = P` 表达（每 layer 每周期最多 issue P 个命令，且访问类命令必须落在不同 bank）。
+- Bank 级并行上限：用 `cmd_issue_width_per_layer=W` + `access_ports_per_layer=A` 表达（每 layer 每周期最多 issue W 个命令，且访问类命令每周期最多 A 个并必须落在不同 bank）。为兼容旧配置，`bank_parallel_ports_per_layer=P` 等价于 `W=A=P`。
 - Row buffer 行命中/冲突：来自 DRAM 设备模型（row open/row hit/row conflict 的判定函数是 `IDRAM::check_rowbuffer_hit` / `check_node_open`）。
 
 暂未建模（v1 仍刻意不做，以免过度设计/YAGNI）：
@@ -107,13 +113,16 @@ GPGPU-Sim shared-memory 访问
 BankParallel 在每个 controller tick 内做：
 
 1. 维护一个本周期已使用的 `used_access_banks` 集合（仅记录访问类命令占用的 bank）。
-2. 重复最多 `P` 次：
+2. 重复最多 `W` 次（`W=cmd_issue_width_per_layer`）：
    - 从 active/priority/read/write buffer 中“挑一个最优请求”（按 scheduler 比较），但会跳过那些会违反 bank 并行约束的候选；
+   - 若当前周期访问端口预算已满（`A=access_ports_per_layer`），则跳过访问类命令，只允许 issue 非访问类命令（例如 ACT/PRE）；
    - 若该请求的当前 `preq_command` 就绪，则 issue；否则继续寻找/或停止。
 3. 若 issue 的命令是访问类（`is_accessing`），将该请求的 bank key 记录进 `used_access_banks`。
 4. 若该命令是请求的 `final_command`：
    - Read：在 `m_read_latency` 后回调完成；
-   - Write：1 cycle 后回调完成。
+   - Write：根据 `write_completion_mode` 决定完成点：
+     - `posted`：下一周期回调完成（保持旧行为）。
+     - `data`：按 `m_write_latency = nCWL + nBL` 在数据“返回点”回调完成。
 
 bank key 的定义（用于“同一 bank”判定）：
 
@@ -124,7 +133,8 @@ bank key 的定义（用于“同一 bank”判定）：
 
 补充两个容易混淆的点（以代码为准）：
 
-- **issue 预算 `P` 是“每周期最多 issue 的命令条数”**：无论是 ACT/PRE 还是 RD/WR，只要被 issue，就会消耗一次 `P` 的预算。
+- **issue 预算 `W` 是“每周期最多 issue 的命令条数”**：无论是 ACT/PRE 还是 RD/WR，只要被 issue，就会消耗一次 `W` 的预算。
+- **访问端口预算 `A` 只约束访问类命令**：RD/WR/RDA/WRA 会消耗 `A` 的预算；ACT/PRE 不消耗 `A`。
 - **bank 冲突约束只对访问类命令生效**：只有 `is_accessing==true` 的命令才会占用 “同一 bank 本周期已用” 的集合。
 
 #### 3.0.4 请求队列、背压与 read/write 模式（v1 默认值）
@@ -138,8 +148,12 @@ BankParallel 控制器内部有 4 类 request buffer：
 
 队列深度（以代码当前默认值为准）：
 
-- `m_priority_buffer.max_size = 512 * 3 + 32`（在 `setup()` 设置）
-- 其余 `ReqBuffer.max_size` 使用 `third_party/ramulator2/src/base/request.h` 的默认值 `32`
+- 默认值：
+  - `priority_buffer_max_size = 512 * 3 + 32`
+  - `active_buffer_max_size = 32`
+  - `read_buffer_max_size = 32`
+  - `write_buffer_max_size = 32`
+- 以上 4 个队列深度现已支持从 YAML 覆盖（字段名如上；实现见 `third_party/ramulator2/src/dram_controller/impl/bank_parallel_dram_controller.cpp`）。
 
 read/write 模式切换：
 
@@ -163,7 +177,7 @@ read/write 模式切换：
 
 因此 v1 适合用于：
 
-- 对比不同 `P`、不同地址映射、不同 org/timing 对 row conflict/bank conflict 的相对影响；
+- 对比不同 `W/A`、不同地址映射、不同 org/timing 对 row conflict/bank conflict 的相对影响；
 - 而不适合直接当成“精确带宽模型”（因为未按 size 做 burst/分段/总线占用建模）。
 
 ### 3.1 DRAM 组织（org）与地址映射（AddrMapper）
@@ -203,21 +217,28 @@ Ramulator2 的 DRAM 组织（`DRAM.org`）决定：
 
 `Controller.impl: BankParallel` 的核心行为：
 
-- 每个 controller cycle 最多 issue `P = bank_parallel_ports_per_layer` 次命令；
+- 每个 controller cycle 最多 issue `W = cmd_issue_width_per_layer` 次命令（默认回退 `bank_parallel_ports_per_layer`）；
 - 对于 `m_command_meta(cmd).is_accessing == true` 的访问类命令（通常对应 RD/WR）：
+  - 每周期最多 issue `A = access_ports_per_layer` 条（默认回退 `bank_parallel_ports_per_layer`）；
   - **同一 cycle 内禁止向同一 bank 并行 issue 多个访问类命令**；
   - bank 的判定依据是地址向量 `addr_vec` 从 `channel` 到 `bank`（包含 bank）的组合键。
 
 这使得：
 
 - 当请求集中打到同一个 bank，会产生“端口/issue 受限 + row buffer 竞争”的综合效果；
-- 当请求分散到不同 bank，则能体现 bank 级并行提升（上限受 `P` 限制）。
+- 当请求分散到不同 bank，则能体现 bank 级并行提升（上限受 `W/A` 限制）。
 
 #### 3.2.1 关键参数
 
-- `Controller.bank_parallel_ports_per_layer`（uint32，默认 1）
-  - 解释：每个 layer（每个 channel）每周期可并行推进的“issue 槽位”数量；
-  - 用途：把“每 layer 的可并行 bank 数/端口数”抽象成可调参数。
+- `Controller.cmd_issue_width_per_layer`（uint32，默认回退 `bank_parallel_ports_per_layer`）
+  - 解释：每个 layer（每个 channel）每周期最多 issue 的命令条数（总发射宽度）。
+- `Controller.access_ports_per_layer`（uint32，默认回退 `bank_parallel_ports_per_layer`）
+  - 解释：每周期最多 issue 的访问类命令（RD/WR/RDA/WRA）条数，并额外要求同周期访问落在不同 bank。
+- `Controller.bank_parallel_ports_per_layer`（uint32，默认 1，legacy）
+  - 解释：旧版单旋钮；若只设置该字段，则默认 `cmd_issue_width_per_layer = access_ports_per_layer = bank_parallel_ports_per_layer`。
+- `Controller.write_completion_mode`（string，默认 `posted`）
+  - `posted`：写请求在发出 final command 后下一周期回调完成（旧行为）。
+  - `data`：写请求在发出 final command 后按 `nCWL+nBL` 回调完成（写 data-return 语义）。
 
 #### 3.2.2 建模选择（当前版本）
 
@@ -269,13 +290,24 @@ MemorySystem:
 
   Controller:
     impl: BankParallel
-    bank_parallel_ports_per_layer: <P>
+    # Parallelism knobs (recommended):
+    cmd_issue_width_per_layer: <W>      # total issue width per layer/channel per cycle
+    access_ports_per_layer: <A>         # max accessing commands per cycle (RD/WR/RDA/WRA)
+    # Backward-compatible legacy knob (optional):
+    # bank_parallel_ports_per_layer: <P>   # if set (and W/A omitted), behaves like W=A=P
+    # Write completion semantics:
+    # - posted: complete at (issue + 1 cycle) (legacy)
+    # - data:   complete at (issue + nCWL + nBL)
+    write_completion_mode: posted
     Scheduler:
       impl: FRFCFS
     RefreshManager:
       impl: None
     RowPolicy:
-      impl: ClosedRowPolicy
+      # Recommended CacheRAM-style row-buffer policy:
+      # - bound per-bank row residency via `cap`
+      # - close via RDA/WRA on the cap-th access (no injected PRE maintenance req)
+      impl: CapAutoPrechargePolicy
       cap: 4
     plugins:
 
@@ -340,7 +372,10 @@ Accel-Sim shared-memory backend 的 real-mode 需要：
 ## 8. 参数小词典（给上层 Accel-Sim 做处理用）
 
 - `layer_count`：3D 堆叠的 layer 数（v0 中映射为 `DRAM.org.channel`）。
-- `P = bank_parallel_ports_per_layer`：每个 layer 的 bank 并行端口数/issue 宽度抽象；v0 中每个 channel/controller 每周期最多 issue P 条命令，并且访问类命令同周期不能落在同一 bank。
+- `W/A`：BankParallel 的并行度拆解：
+  - `W = cmd_issue_width_per_layer`：每个 layer 每周期最多 issue 的命令条数（总发射宽度）。
+  - `A = access_ports_per_layer`：每周期最多 issue 的访问类命令条数，并且访问类命令同周期不能落在同一 bank。
+  - 兼容：`bank_parallel_ports_per_layer = P` 等价于 `W=A=P`。
 - `bank_count`：每个 layer 的 bank 数（由所选 `DRAM.org` preset 决定，或未来 Mono3D 的 org 显式参数决定）。
 - `row buffer`：由 DRAM 设备模型维护的 bank 内行状态；`row_hits/row_conflicts/row_misses` 统计用它判定。
 

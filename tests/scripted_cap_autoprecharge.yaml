@@ -1,0 +1,64 @@
+# Smoke test: CapAutoPrechargePolicy can be instantiated and runs to completion.
+#
+# Intent:
+# - Exercise a row-policy that closes rows via RDA/WRA (auto-precharge), avoiding
+#   separate PRE maintenance requests.
+# - This is a functional "no crash" test; timing/throughput validation is done
+#   via higher-level Accel-Sim experiments.
+#
+# Run:
+#   "third_party/ramulator2/build/ramulator2" -f "third_party/ramulator2/tests/scripted_cap_autoprecharge.yaml"
+
+Frontend:
+  impl: Scripted
+  clock_ratio: 1
+  max_cycles: 200
+  script:
+    # Three reads to the same address; with cap=2 the policy will keep the row
+    # open for the first two accesses and close on the 2nd access via RDA.
+    - { type: read, addr: 0x0, at: 0 }
+    - { type: read, addr: 0x0, at: 10 }
+    - { type: read, addr: 0x0, at: 20 }
+  expectations:
+    - { kind: order, before: 0, after: 1 }
+    - { kind: order, before: 1, after: 2 }
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 1
+
+  DRAM:
+    impl: Mono3D
+    org:
+      channel_width: 256
+      prefetch_size: 1
+      channel: 1
+      rank: 1
+      bankgroup: 1
+      bank: 8
+      row: 1024
+      column: 256
+      dq: 256
+    timing:
+      preset: Mono3D_Default
+      # Make misses visible but still complete quickly.
+      nRCD: 6
+      nRP: 4
+      nRAS: 8
+
+  Controller:
+    impl: BankParallel
+    cmd_issue_width_per_layer: 2
+    access_ports_per_layer: 1
+    write_completion_mode: data
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: None
+    RowPolicy:
+      impl: CapAutoPrechargePolicy
+      cap: 2
+
+  AddrMapper:
+    impl: RoBaRaCoCh
+

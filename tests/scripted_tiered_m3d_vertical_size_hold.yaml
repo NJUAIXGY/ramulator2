@@ -1,0 +1,102 @@
+# Functional P1 test: vertical ports should remain occupied for multiple cycles
+# as a function of request size, not just the cycle of issuance.
+#
+# Expected behavior:
+# - Warm up two remote-tier rows.
+# - Issue a larger cross-tier read first, then a smaller one one cycle later.
+# - `vertical_transfer_ports: 1` plus `vertical_transfer_cycles_per_burst: 2`
+#   should keep the shared vertical path busy long enough that the second
+#   request finishes at least 5 cycles after the first.
+
+Frontend:
+  impl: Scripted
+  clock_ratio: 1
+  max_cycles: 5000
+  script:
+    - type: read
+      addr: 0x2000
+      size: 64
+      path_class: cross_tier
+      tier_hint: 1
+      at: 0
+    - type: read
+      addr: 0x4000
+      size: 64
+      path_class: cross_tier
+      tier_hint: 2
+      at: 1
+    - type: read
+      addr: 0x2000
+      size: 128
+      path_class: cross_tier
+      tier_hint: 1
+      at: 20
+    - type: read
+      addr: 0x4000
+      size: 32
+      path_class: cross_tier
+      tier_hint: 2
+      at: 21
+  expectations:
+    - kind: min_done_cycle
+      req: 3
+      cycle: 34
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 1
+
+  DRAM:
+    impl: Mono3DTiered
+    org:
+      channel_width: 256
+      prefetch_size: 1
+      channel: 1
+      tier: 4
+      bankgroup: 1
+      bank: 8
+      row: 256
+      column: 256
+      dq: 256
+    timing:
+      preset: Mono3DTiered_Default
+      tCK_ps: 2500
+      nBL: 0
+      nCL: 4
+      nCWL: 4
+      nRCD: 2
+      nRTP: 2
+      nWR: 2
+      nRAS: 4
+      nRP: 2
+      nRC: 6
+      nWTR: 0
+      nRTW: 0
+      nCCDS: 0
+      nRRDS: 0
+      nFAW: 0
+
+  Controller:
+    impl: TieredM3D
+    size_aware_timing: true
+    local_burst_transfer_cycles: 1
+    vertical_transfer_cycles_per_burst: 2
+    write_completion_mode: posted
+    cmd_issue_width_per_channel: 4
+    shared_access_ports_per_channel: 2
+    tier_access_ports: 1
+    vertical_transfer_ports: 1
+    active_buffer_max_size: 128
+    read_buffer_max_size: 128
+    write_buffer_max_size: 128
+    priority_buffer_max_size: 128
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: None
+    RowPolicy:
+      impl: OpenRowPolicy
+    plugins:
+
+  AddrMapper:
+    impl: RoBaRaCoCh

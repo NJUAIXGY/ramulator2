@@ -1,0 +1,51 @@
+# Minimal smoke config to verify `Controller.impl: TieredM3D` can be instantiated
+# together with `DRAM.impl: Mono3DTiered`.
+#
+# Run:
+#   cmake --build third_party/ramulator2/build -j
+#   third_party/ramulator2/build/ramulator2 -f third_party/ramulator2/tests/tiered_m3d_smoke_config.yaml
+#
+# Notes:
+# - This is a stage-C controller smoke test.
+# - It keeps the current request semantics unchanged and only checks the new
+#   tier-aware controller path can be constructed.
+
+Frontend:
+  impl: GEM5
+  clock_ratio: 1
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 1
+
+  DRAM:
+    impl: Mono3DTiered
+    org:
+      channel_width: 256
+      prefetch_size: 1
+      channel: 1
+      tier: 4
+      bankgroup: 1
+      bank: 8
+      row: 256
+      column: 256
+      dq: 256
+    timing:
+      preset: Mono3DTiered_Default
+
+  Controller:
+    impl: TieredM3D
+    cmd_issue_width_per_channel: 4
+    shared_access_ports_per_channel: 2
+    tier_access_ports: 1
+    vertical_transfer_ports: 1
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: None
+    RowPolicy:
+      impl: OpenRowPolicy
+    plugins:
+
+  AddrMapper:
+    impl: RoBaRaCoCh

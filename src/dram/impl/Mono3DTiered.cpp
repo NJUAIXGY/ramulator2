@@ -8,27 +8,29 @@
 
 namespace Ramulator {
 
-// Mono3D: a minimal DRAM device model intended for SM-attached 3D-stacked
-// shared-memory (v1). It focuses on row-buffer behavior and bank-level timing,
-// while allowing "layer -> channel" mapping via org.channel.
-class Mono3D : public IDRAM, public Implementation {
-  RAMULATOR_REGISTER_IMPLEMENTATION(IDRAM, Mono3D, "Mono3D",
-                                   "Mono3D (3D-stacked) DRAM Device Model");
+// Mono3DTiered: a minimal Monolithic-3D-oriented DRAM device model for
+// SM-attached shared-memory studies. It introduces an explicit internal "tier"
+// level under each host-visible channel, while intentionally preserving the
+// existing Mono3D timing simplifications (row-buffer behavior + bank timing).
+// In other words: this model fixes the organization semantics first, and defers
+// vertical/shared resource modeling to the next controller stage.
+class Mono3DTiered : public IDRAM, public Implementation {
+  RAMULATOR_REGISTER_IMPLEMENTATION(IDRAM, Mono3DTiered, "Mono3DTiered",
+                                   "Mono3DTiered (Monolithic 3D-Oriented) DRAM Device Model");
 
  public:
-  // Minimal preset: users are expected to override org/timing with Mono3D params.
+  // Minimal preset: users are expected to override org/timing with Mono3DTiered params.
   inline static const std::map<std::string, Organization> org_presets = {
-      //    name              density   dq     Ch  Ra  Bg  Ba   Ro     Co
-      {"Mono3D_DefaultOrg", {0,        256, {1, 1, 1, 8, 1 << 10, 1 << 8}}},
+      //    name                    density   dq     Ch  Ti  Bg  Ba   Ro     Co
+      {"Mono3DTiered_DefaultOrg", {0,        256, {1, 1, 1, 8, 1 << 10, 1 << 8}}},
   };
 
-  // Minimal timing preset (cycles). Override in YAML with Mono3D-specific values.
+  // Minimal timing preset (cycles). Override in YAML with Mono3DTiered-specific values.
   inline static const std::map<std::string, std::vector<int>> timing_presets = {
       // name               rate  nBL nCL nRCD nRP nRAS nRC nWR nRTP nCWL nWTR
-      //                    nRTW nCCDS nRRDS nFAW nRFC nREFI tCK_ps
-      {"Mono3D_Default",
-       {2000, 1, 10, 10, 10, 24, 34, 10, 5, 8, 5, 5, 1, 4, 16, 32, 7800,
-        1000}},
+      //                    nRTW nCCDS nRRDS nFAW tCK_ps
+      {"Mono3DTiered_Default",
+       {2000, 1, 10, 10, 10, 24, 34, 10, 5, 8, 5, 5, 1, 4, 16, 1000}},
   };
 
   /************************************************
@@ -37,7 +39,7 @@ class Mono3D : public IDRAM, public Implementation {
   int m_internal_prefetch_size = 1;
 
   inline static constexpr ImplDef m_levels = {
-      "channel", "rank", "bankgroup", "bank", "row", "column",
+      "channel", "tier", "bankgroup", "bank", "row", "column",
   };
 
   /************************************************
@@ -46,26 +48,20 @@ class Mono3D : public IDRAM, public Implementation {
   inline static constexpr ImplDef m_commands = {
       "ACT",
       "PRE",
-      "PREA",
       "RD",
       "WR",
       "RDA",
       "WRA",
-      "REFab",
-      "REFab_end",
   };
 
   inline static const ImplLUT m_command_scopes =
       LUT(m_commands, m_levels, {
                                   {"ACT", "row"},
                                   {"PRE", "bank"},
-                                  {"PREA", "rank"},
                                   {"RD", "column"},
                                   {"WR", "column"},
                                   {"RDA", "column"},
                                   {"WRA", "column"},
-                                  {"REFab", "rank"},
-                                  {"REFab_end", "rank"},
                               });
 
   inline static const ImplLUT m_command_meta = LUT<DRAMCommandMeta>(
@@ -73,19 +69,15 @@ class Mono3D : public IDRAM, public Implementation {
                       // open? close? access? refresh?
                       {"ACT", {true, false, false, false}},
                       {"PRE", {false, true, false, false}},
-                      {"PREA", {false, true, false, false}},
                       {"RD", {false, false, true, false}},
                       {"WR", {false, false, true, false}},
                       {"RDA", {false, true, true, false}},
                       {"WRA", {false, true, true, false}},
-                      {"REFab", {false, false, false, true}},
-                      {"REFab_end", {false, true, false, false}},
                   });
 
   inline static constexpr ImplDef m_requests = {
       "read",
       "write",
-      "all-bank-refresh",
       "open-row",
       "close-row",
   };
@@ -94,7 +86,6 @@ class Mono3D : public IDRAM, public Implementation {
       LUT(m_requests, m_commands, {
                                      {"read", "RD"},
                                      {"write", "WR"},
-                                     {"all-bank-refresh", "REFab"},
                                      {"open-row", "ACT"},
                                      {"close-row", "PRE"},
                                  });
@@ -118,8 +109,6 @@ class Mono3D : public IDRAM, public Implementation {
       "nCCDS",  // CAS -> CAS (same channel) (cycles)
       "nRRDS",  // ACT -> ACT (diff banks) (cycles)
       "nFAW",   // 4-ACT window (cycles)
-      "nRFC",   // refresh cycle time (cycles)
-      "nREFI",  // refresh interval (cycles)
       "tCK_ps",
   };
 
@@ -136,7 +125,7 @@ class Mono3D : public IDRAM, public Implementation {
   inline static const ImplLUT m_init_states =
       LUT(m_levels, m_states, {
                                  {"channel", "N/A"},
-                                 {"rank", "N/A"},
+                                 {"tier", "N/A"},
                                  {"bankgroup", "N/A"},
                                  {"bank", "Closed"},
                                  {"row", "Closed"},
@@ -144,9 +133,9 @@ class Mono3D : public IDRAM, public Implementation {
                              });
 
  public:
-  struct Node : public DRAMNodeBase<Mono3D> {
-    Node(Mono3D* dram, Node* parent, int level, int id)
-        : DRAMNodeBase<Mono3D>(dram, parent, level, id) {}
+  struct Node : public DRAMNodeBase<Mono3DTiered> {
+    Node(Mono3DTiered* dram, Node* parent, int level, int id)
+        : DRAMNodeBase<Mono3DTiered>(dram, parent, level, id) {}
   };
 
   std::vector<Node*> m_channels;
@@ -157,21 +146,11 @@ class Mono3D : public IDRAM, public Implementation {
   FuncMatrix<RowopenFunc_t<Node>> m_rowopens;
 
  public:
-  void tick() override {
-    m_clk++;
-
-    for (int i = static_cast<int>(m_future_actions.size()) - 1; i >= 0; --i) {
-      auto& future_action = m_future_actions[i];
-      if (future_action.clk == m_clk) {
-        handle_future_action(future_action.cmd, future_action.addr_vec);
-        m_future_actions.erase(m_future_actions.begin() + i);
-      }
-    }
-  }
+  void tick() override { m_clk++; }
 
   void init() override {
     set_organization();
-    // Mono3D allows YAML to override org.prefetch_size. We must declare specs
+    // Mono3DTiered allows YAML to override org.prefetch_size. We must declare specs
     // after reading organization parameters so the base IDRAM fields reflect
     // the configured prefetch size (tx_bytes derivation, addr mapping, etc.).
     RAMULATOR_DECLARE_SPECS();
@@ -189,7 +168,6 @@ class Mono3D : public IDRAM, public Implementation {
     int channel_id = addr_vec[m_levels["channel"]];
     m_channels[channel_id]->update_timing(command, addr_vec, m_clk);
     m_channels[channel_id]->update_states(command, addr_vec, m_clk);
-    check_future_action(command, addr_vec);
   }
 
   int get_preq_command(int command, const AddrVec_t& addr_vec) override {
@@ -259,12 +237,13 @@ class Mono3D : public IDRAM, public Implementation {
     }
 
     // If density is not specified (0), derive a per-channel density in Mb.
-    size_t calc_density_bits = size_t(m_organization.count[m_levels["rank"]]) *
-                               size_t(m_organization.count[m_levels["bankgroup"]]) *
-                               size_t(m_organization.count[m_levels["bank"]]) *
-                               size_t(m_organization.count[m_levels["row"]]) *
-                               size_t(m_organization.count[m_levels["column"]]) *
-                               size_t(m_organization.dq);
+    // For Mono3DTiered, this means multiplying all internal levels under a
+    // host-visible channel, i.e. tier/bankgroup/bank/row/column * dq.
+    size_t calc_density_bits = size_t(m_organization.dq);
+    for (int i = 0; i < m_levels.size(); i++) {
+      if (i == m_levels["channel"]) continue;
+      calc_density_bits *= size_t(m_organization.count[i]);
+    }
     size_t calc_density_mb = calc_density_bits >> 20;
 
     if (m_organization.density <= 0) {
@@ -424,29 +403,6 @@ class Mono3D : public IDRAM, public Implementation {
                                    .following = {"ACT"},
                                    .latency = V("nCWL") + V("nBL") + V("nWR") +
                                               V("nRP")},
-
-                                  /*** Rank ***/
-                                  {.level = "rank",
-                                   .preceding = {"ACT"},
-                                   .following = {"REFab"},
-                                   .latency = V("nRC")},
-                                  {.level = "rank",
-                                   .preceding = {"PRE", "PREA"},
-                                   .following = {"REFab"},
-                                   .latency = V("nRP")},
-                                  {.level = "rank",
-                                   .preceding = {"RDA"},
-                                   .following = {"REFab"},
-                                   .latency = V("nRTP") + V("nRP")},
-                                  {.level = "rank",
-                                   .preceding = {"WRA"},
-                                   .following = {"REFab"},
-                                   .latency = V("nCWL") + V("nBL") + V("nWR") +
-                                              V("nRP")},
-                                  {.level = "rank",
-                                   .preceding = {"REFab"},
-                                   .following = {"ACT", "PREA"},
-                                   .latency = V("nRFC")},
                               });
 #undef V
   }
@@ -456,19 +412,13 @@ class Mono3D : public IDRAM, public Implementation {
                      std::vector<ActionFunc_t<Node>>(m_commands.size()));
 
     m_actions[m_levels["bank"]][m_commands["ACT"]] =
-        Lambdas::Action::Bank::ACT<Mono3D>;
+        Lambdas::Action::Bank::ACT<Mono3DTiered>;
     m_actions[m_levels["bank"]][m_commands["PRE"]] =
-        Lambdas::Action::Bank::PRE<Mono3D>;
+        Lambdas::Action::Bank::PRE<Mono3DTiered>;
     m_actions[m_levels["bank"]][m_commands["RDA"]] =
-        Lambdas::Action::Bank::PRE<Mono3D>;
+        Lambdas::Action::Bank::PRE<Mono3DTiered>;
     m_actions[m_levels["bank"]][m_commands["WRA"]] =
-        Lambdas::Action::Bank::PRE<Mono3D>;
-    m_actions[m_levels["rank"]][m_commands["PREA"]] =
-        Lambdas::Action::Rank::PREab<Mono3D>;
-    m_actions[m_levels["rank"]][m_commands["REFab"]] =
-        Lambdas::Action::Rank::REFab<Mono3D>;
-    m_actions[m_levels["rank"]][m_commands["REFab_end"]] =
-        Lambdas::Action::Rank::REFab_end<Mono3D>;
+        Lambdas::Action::Bank::PRE<Mono3DTiered>;
   }
 
   void set_preqs() {
@@ -476,44 +426,42 @@ class Mono3D : public IDRAM, public Implementation {
                    std::vector<PreqFunc_t<Node>>(m_commands.size()));
 
     m_preqs[m_levels["bank"]][m_commands["RD"]] =
-        Lambdas::Preq::Bank::RequireRowOpen<Mono3D>;
+        Lambdas::Preq::Bank::RequireRowOpen<Mono3DTiered>;
     m_preqs[m_levels["bank"]][m_commands["WR"]] =
-        Lambdas::Preq::Bank::RequireRowOpen<Mono3D>;
+        Lambdas::Preq::Bank::RequireRowOpen<Mono3DTiered>;
     m_preqs[m_levels["bank"]][m_commands["RDA"]] =
-        Lambdas::Preq::Bank::RequireRowOpen<Mono3D>;
+        Lambdas::Preq::Bank::RequireRowOpen<Mono3DTiered>;
     m_preqs[m_levels["bank"]][m_commands["WRA"]] =
-        Lambdas::Preq::Bank::RequireRowOpen<Mono3D>;
-    m_preqs[m_levels["rank"]][m_commands["REFab"]] =
-        Lambdas::Preq::Rank::RequireAllBanksClosed<Mono3D>;
+        Lambdas::Preq::Bank::RequireRowOpen<Mono3DTiered>;
   }
 
   void set_rowhits() {
     m_rowhits.resize(m_levels.size(),
                      std::vector<RowhitFunc_t<Node>>(m_commands.size()));
     m_rowhits[m_levels["bank"]][m_commands["RD"]] =
-        Lambdas::RowHit::Bank::RDWR<Mono3D>;
+        Lambdas::RowHit::Bank::RDWR<Mono3DTiered>;
     m_rowhits[m_levels["bank"]][m_commands["WR"]] =
-        Lambdas::RowHit::Bank::RDWR<Mono3D>;
+        Lambdas::RowHit::Bank::RDWR<Mono3DTiered>;
     // Auto-precharge variants should be counted as row hits too (same bank/row).
     m_rowhits[m_levels["bank"]][m_commands["RDA"]] =
-        Lambdas::RowHit::Bank::RDWR<Mono3D>;
+        Lambdas::RowHit::Bank::RDWR<Mono3DTiered>;
     m_rowhits[m_levels["bank"]][m_commands["WRA"]] =
-        Lambdas::RowHit::Bank::RDWR<Mono3D>;
+        Lambdas::RowHit::Bank::RDWR<Mono3DTiered>;
   }
 
   void set_rowopens() {
     m_rowopens.resize(m_levels.size(),
                       std::vector<RowopenFunc_t<Node>>(m_commands.size()));
     m_rowopens[m_levels["bank"]][m_commands["RD"]] =
-        Lambdas::RowOpen::Bank::RDWR<Mono3D>;
+        Lambdas::RowOpen::Bank::RDWR<Mono3DTiered>;
     m_rowopens[m_levels["bank"]][m_commands["WR"]] =
-        Lambdas::RowOpen::Bank::RDWR<Mono3D>;
+        Lambdas::RowOpen::Bank::RDWR<Mono3DTiered>;
     // Auto-precharge variants still require an open row, and should be treated
     // as "row open" for conflict vs miss classification.
     m_rowopens[m_levels["bank"]][m_commands["RDA"]] =
-        Lambdas::RowOpen::Bank::RDWR<Mono3D>;
+        Lambdas::RowOpen::Bank::RDWR<Mono3DTiered>;
     m_rowopens[m_levels["bank"]][m_commands["WRA"]] =
-        Lambdas::RowOpen::Bank::RDWR<Mono3D>;
+        Lambdas::RowOpen::Bank::RDWR<Mono3DTiered>;
   }
 
   void create_nodes() {
@@ -522,22 +470,6 @@ class Mono3D : public IDRAM, public Implementation {
       Node* channel = new Node(this, nullptr, 0, i);
       m_channels.push_back(channel);
     }
-  }
-
-  void check_future_action(int command, const AddrVec_t& addr_vec) {
-    if (command == m_commands("REFab")) {
-      m_future_actions.push_back(
-          {command, addr_vec, m_clk + m_timing_vals("nRFC")});
-    }
-  }
-
-  void handle_future_action(int command, const AddrVec_t& addr_vec) {
-    if (command != m_commands("REFab")) {
-      return;
-    }
-    const int channel_id = addr_vec[m_levels["channel"]];
-    m_channels[channel_id]->update_states(m_commands("REFab_end"), addr_vec,
-                                          m_clk);
   }
 };
 

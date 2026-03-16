@@ -1,15 +1,13 @@
 #include "dram_controller/controller.h"
-#include "dram_controller/bank_machine.h"
 #include "dram_controller/bank_state_scoreboard.h"
 #include "memory_system/memory_system.h"
 
 #include <algorithm>
 #include <array>
 #include <deque>
+#include <set>
 #include <sstream>
 #include <string>
-#include <string_view>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -18,9 +16,7 @@ namespace Ramulator {
 namespace {
 
 constexpr int kShmemTrafficClassScratchpadIdx = 4;
-constexpr int kShmemPhaseIdScratchpadIdx = 9;
 constexpr size_t kNumExternalTrafficClasses = 3;
-constexpr size_t kNumShmemPhases = 3;
 
 enum class ExternalTrafficClass : int {
   kForeground = 0,
@@ -67,21 +63,13 @@ bool is_valid_source_id(const Request& req, size_t num_cores) {
   return req.source_id >= 0 && static_cast<size_t>(req.source_id) < num_cores;
 }
 
-size_t shmem_phase_index(const Request& req) {
-  const int raw = req.scratchpad[kShmemPhaseIdScratchpadIdx];
-  if (raw <= 0) return 0;
-  if (raw == 1) return 1;
-  return kNumShmemPhases - 1;
-}
-
 }  // namespace
 
-class BankParallelDRAMController final : public IDRAMController,
-                                         public Implementation {
+class TieredM3DController final : public IDRAMController, public Implementation {
   RAMULATOR_REGISTER_IMPLEMENTATION(
-      IDRAMController, BankParallelDRAMController, "BankParallel",
-      "A DRAM controller that can issue up to N commands per cycle and limits "
-      "concurrent RD/WR-like accesses to distinct banks within a channel.")
+      IDRAMController, TieredM3DController, "TieredM3D",
+      "A tier-aware DRAM controller that models shared channel issue/access "
+      "resources together with per-tier access-port budgets.")
 
  private:
   std::deque<Request>
@@ -93,6 +81,8 @@ class BankParallelDRAMController final : public IDRAMController,
   ReqBuffer m_write_buffer;     // Write request buffer
 
   int m_bank_addr_idx = -1;
+  int m_tier_addr_idx = -1;
+  size_t m_num_tiers = 1;
 
   float m_wr_low_watermark;
   float m_wr_high_watermark;
@@ -100,14 +90,23 @@ class BankParallelDRAMController final : public IDRAMController,
 
   // Legacy knob: previously used for both "issue width" and "access ports".
   uint32_t m_bank_parallel_ports = 1;
-  // New knobs (v2):
+  // New knobs (TieredM3D):
   // - m_cmd_issue_width: total #commands issued per controller cycle.
-  // - m_access_ports: max #accessing commands (RD/WR/RDA/WRA) per cycle;
-  //   additionally constrained to distinct banks.
+  // - m_shared_access_ports: shared #accessing commands per controller cycle.
+  // - m_tier_access_ports: per-tier #accessing commands per controller cycle.
+  // - m_vertical_transfer_ports: remote-tier accesses per controller cycle.
   uint32_t m_cmd_issue_width = 1;
-  uint32_t m_access_ports = 1;
+  uint32_t m_shared_access_ports = 1;
+  uint32_t m_tier_access_ports = 1;
+  uint32_t m_vertical_transfer_ports = 0;
+  bool m_size_aware_timing = true;
+  uint32_t m_local_burst_transfer_cycles = 1;
+  uint32_t m_vertical_transfer_cycles_per_burst = 1;
+  uint32_t m_vertical_copy_cycles_per_burst = 1;
+  uint32_t m_transfer_unit_bytes = 1;
   enum class WriteCompletionMode { kPosted, kData };
   WriteCompletionMode m_write_completion_mode = WriteCompletionMode::kPosted;
+  std::multiset<Clk_t> m_active_vertical_transfer_releases;
 
   bool m_qos_enable = true;
   bool m_allow_foreground_read_interrupt_write_mode = true;
@@ -118,24 +117,6 @@ class BankParallelDRAMController final : public IDRAMController,
   bool m_shadow_scoreboard_fail_fast = false;
   bool m_shadow_scoreboard_log_mismatch = false;
   BankStateScoreboard m_shadow_scoreboard;
-  struct RefreshLifecycleState {
-    bool pending = false;
-    bool active = false;
-    RefreshScopeKind scope_kind = RefreshScopeKind::kNone;
-    AddrVec_t scope_addr_vec {};
-    Clk_t pending_since_cycle = -1;
-    Clk_t active_since_cycle = -1;
-    Clk_t active_until_cycle = -1;
-    uint64_t epoch = 0;
-  };
-  RefreshLifecycleState m_refresh_state;
-  Clk_t m_refresh_window_cycles = -1;
-  BankMachine m_bank_machine;
-  uint32_t m_scoreboard_autoprecharge_cap = 0;
-  int m_cmd_rd = -1;
-  int m_cmd_wr = -1;
-  int m_cmd_rda = -1;
-  int m_cmd_wra = -1;
 
   size_t s_row_hits = 0;
   size_t s_row_misses = 0;
@@ -146,20 +127,6 @@ class BankParallelDRAMController final : public IDRAMController,
   size_t s_write_row_hits = 0;
   size_t s_write_row_misses = 0;
   size_t s_write_row_conflicts = 0;
-
-  std::array<size_t, kNumShmemPhases> s_phase_row_hits = {0, 0, 0};
-  std::array<size_t, kNumShmemPhases> s_phase_row_misses = {0, 0, 0};
-  std::array<size_t, kNumShmemPhases> s_phase_row_conflicts = {0, 0, 0};
-
-  TrafficClassCounterArray s_row_hits_by_class = {0, 0, 0};
-  TrafficClassCounterArray s_row_misses_by_class = {0, 0, 0};
-  TrafficClassCounterArray s_row_conflicts_by_class = {0, 0, 0};
-  TrafficClassCounterArray s_read_row_hits_by_class = {0, 0, 0};
-  TrafficClassCounterArray s_read_row_misses_by_class = {0, 0, 0};
-  TrafficClassCounterArray s_read_row_conflicts_by_class = {0, 0, 0};
-  TrafficClassCounterArray s_write_row_hits_by_class = {0, 0, 0};
-  TrafficClassCounterArray s_write_row_misses_by_class = {0, 0, 0};
-  TrafficClassCounterArray s_write_row_conflicts_by_class = {0, 0, 0};
 
   size_t m_num_cores = 0;
   std::vector<size_t> s_read_row_hits_per_core;
@@ -175,6 +142,12 @@ class BankParallelDRAMController final : public IDRAMController,
   size_t s_num_background_write_reqs = 0;
   size_t s_num_shadow_read_reqs = 0;
   size_t s_num_shadow_write_reqs = 0;
+  size_t s_tier_local_read_reqs = 0;
+  size_t s_tier_local_write_reqs = 0;
+  size_t s_cross_tier_read_reqs = 0;
+  size_t s_cross_tier_write_reqs = 0;
+  size_t s_vertical_copy_read_reqs = 0;
+  size_t s_vertical_copy_write_reqs = 0;
   size_t s_queue_len = 0;
   size_t s_read_queue_len = 0;
   size_t s_write_queue_len = 0;
@@ -204,44 +177,42 @@ class BankParallelDRAMController final : public IDRAMController,
 
   size_t s_max_cmds_issued_per_cycle = 0;
   size_t s_max_access_cmds_issued_per_cycle = 0;
+  size_t s_max_shared_access_cmds_issued_per_cycle = 0;
+  size_t s_max_vertical_transfer_cmds_issued_per_cycle = 0;
   size_t s_cmds_issued_total = 0;
   size_t s_access_cmds_issued_total = 0;
+  size_t s_local_tier_access_cmds_issued_total = 0;
+  size_t s_shared_access_cmds_issued_total = 0;
+  size_t s_vertical_transfer_cmds_issued_total = 0;
+  size_t s_cross_tier_cmds_issued_total = 0;
+  size_t s_vertical_copy_cmds_issued_total = 0;
+  size_t s_vertical_port_busy_cycles = 0;
+  size_t s_cross_tier_transfer_cycles_total = 0;
+  size_t s_vertical_copy_transfer_cycles_total = 0;
   float s_avg_cmds_issued_per_cycle = 0;
   float s_avg_access_cmds_issued_per_cycle = 0;
+  float s_avg_shared_access_cmds_issued_per_cycle = 0;
+  float s_avg_vertical_transfer_cmds_issued_per_cycle = 0;
+  std::vector<size_t> s_tier_access_cmds_issued_total;
+  std::vector<size_t> s_max_tier_access_cmds_issued_per_cycle;
+  std::vector<float> s_avg_tier_access_cmds_issued_per_cycle;
+  std::vector<std::vector<size_t>> s_cross_tier_reqs_by_src_dst;
+  std::vector<std::vector<size_t>> s_vertical_copy_reqs_by_src_dst;
   size_t s_shadow_scoreboard_diff_checks = 0;
   size_t s_shadow_scoreboard_rowhit_mismatches = 0;
   size_t s_shadow_scoreboard_rowopen_mismatches = 0;
+  size_t s_shadow_scoreboard_prereq_checks = 0;
+  size_t s_shadow_scoreboard_prereq_mismatches = 0;
   size_t s_shadow_scoreboard_ready_checks = 0;
   size_t s_shadow_scoreboard_ready_mismatches = 0;
+  size_t s_shadow_scoreboard_ready_oracle_blocked_while_scoreboard_ready = 0;
+  size_t s_shadow_scoreboard_ready_oracle_ready_while_scoreboard_blocked = 0;
   size_t s_shadow_scoreboard_ready_mismatch_open = 0;
   size_t s_shadow_scoreboard_ready_mismatch_access = 0;
   size_t s_shadow_scoreboard_ready_mismatch_close = 0;
   size_t s_shadow_scoreboard_ready_mismatch_other = 0;
   size_t s_shadow_scoreboard_ready_blocked_by_scoreboard = 0;
   size_t s_shadow_scoreboard_ready_blocked_by_oracle = 0;
-  size_t s_shadow_scoreboard_ready_oracle_blocked_while_scoreboard_ready = 0;
-  size_t s_shadow_scoreboard_ready_oracle_ready_while_scoreboard_blocked = 0;
-  size_t s_shadow_scoreboard_prereq_checks = 0;
-  size_t s_shadow_scoreboard_prereq_mismatches = 0;
-  size_t s_shadow_scoreboard_refresh_enter_events = 0;
-  size_t s_controller_refresh_pending_events = 0;
-  size_t s_controller_refresh_enter_events = 0;
-  size_t s_controller_refresh_exit_events = 0;
-  size_t s_controller_refresh_pending_cycles = 0;
-  size_t s_controller_refresh_active_cycles = 0;
-  size_t s_controller_refresh_epoch = 0;
-  size_t s_controller_refresh_scope_kind_last = 0;
-  size_t s_controller_refresh_window_cycles = 0;
-  size_t s_shadow_scoreboard_refreshing_banks_peak = 0;
-  size_t s_shadow_scoreboard_pending_banks_peak = 0;
-  size_t s_scoreboard_forced_autoprecharge = 0;
-  size_t s_bankmachine_transition_open = 0;
-  size_t s_bankmachine_transition_access = 0;
-  size_t s_bankmachine_transition_close = 0;
-  size_t s_bankmachine_transition_refresh = 0;
-  size_t s_bankmachine_transition_other = 0;
-
-  using IssueCommandPlan = BankMachine::IssuePlan;
 
  public:
   void init() override {
@@ -262,17 +233,63 @@ class BankParallelDRAMController final : public IDRAMController,
                 "distinct banks within the channel.")
             .default_val(1);
 
-    m_cmd_issue_width =
+    const uint32_t legacy_cmd_issue_width =
         param<uint32_t>("cmd_issue_width_per_layer")
             .desc(
-                "Max number of DRAM commands issued per controller cycle (total issue width).")
+                "Legacy alias for cmd_issue_width_per_channel in tier-aware controllers.")
             .default_val(m_bank_parallel_ports);
-    m_access_ports =
+    m_cmd_issue_width =
+        param<uint32_t>("cmd_issue_width_per_channel")
+            .desc(
+                "Max number of DRAM commands issued per controller cycle for the whole channel.")
+            .default_val(legacy_cmd_issue_width);
+
+    const uint32_t legacy_shared_access_ports =
         param<uint32_t>("access_ports_per_layer")
             .desc(
-                "Max number of accessing DRAM commands (RD/WR/RDA/WRA) issued per controller cycle; "
-                "accessing commands are additionally constrained to distinct banks within the channel.")
+                "Legacy alias for shared_access_ports_per_channel in tier-aware controllers.")
             .default_val(m_bank_parallel_ports);
+    m_shared_access_ports =
+        param<uint32_t>("shared_access_ports_per_channel")
+            .desc(
+                "Max number of accessing DRAM commands (RD/WR/RDA/WRA) issued per channel cycle "
+                "across all tiers; accessing commands are additionally constrained to distinct banks.")
+            .default_val(legacy_shared_access_ports);
+    m_tier_access_ports =
+        param<uint32_t>("tier_access_ports")
+            .desc(
+                "Max number of accessing DRAM commands issued per tier per controller cycle.")
+            .default_val(1);
+    m_vertical_transfer_ports =
+        param<uint32_t>("vertical_transfer_ports")
+            .desc(
+                "Max number of remote-tier accessing commands that can use the shared "
+                "vertical path per channel cycle (0=unlimited/disabled).")
+            .default_val(0);
+    m_size_aware_timing =
+        param<bool>("size_aware_timing")
+            .desc(
+                "Enable request-size-aware completion timing and multi-cycle vertical "
+                "path occupancy in TieredM3D.")
+            .default_val(true);
+    m_local_burst_transfer_cycles =
+        param<uint32_t>("local_burst_transfer_cycles")
+            .desc(
+                "Additional completion cycles charged per extra transfer unit beyond "
+                "the first for read/data-write requests.")
+            .default_val(1);
+    m_vertical_transfer_cycles_per_burst =
+        param<uint32_t>("vertical_transfer_cycles_per_burst")
+            .desc(
+                "Cycles that one remote transfer unit occupies a vertical port and "
+                "adds to read/data-write completion latency.")
+            .default_val(1);
+    m_vertical_copy_cycles_per_burst =
+        param<uint32_t>("vertical_copy_cycles_per_burst")
+            .desc(
+                "Cycles that one vertical-copy transfer unit occupies a vertical "
+                "port and adds to completion latency.")
+            .default_val(m_vertical_transfer_cycles_per_burst);
 
     const std::string write_mode =
         param<std::string>("write_completion_mode")
@@ -291,7 +308,7 @@ class BankParallelDRAMController final : public IDRAMController,
 
     m_qos_enable =
         param<bool>("qos_enable")
-            .desc("Enable shared-aware foreground/background/shadow QoS in BankParallel.")
+            .desc("Enable shared-aware foreground/background/shadow QoS in TieredM3D.")
             .default_val(true);
     m_allow_foreground_read_interrupt_write_mode =
         param<bool>("qos_allow_foreground_read_interrupt_write_mode")
@@ -321,12 +338,6 @@ class BankParallelDRAMController final : public IDRAMController,
         param<bool>("shadow_scoreboard_log_mismatch")
             .desc("Log row-state mismatches between shadow scoreboard and DRAM.")
             .default_val(false);
-    m_scoreboard_autoprecharge_cap =
-        param<uint32_t>("scoreboard_autoprecharge_cap")
-            .desc(
-                "When >0, force RDA/WRA in controller once a row reaches this many accesses "
-                "according to shadow scoreboard (0 disables controller-side cap policy).")
-            .default_val(0);
 
     // Queue depths: keep defaults small for legacy behavior, but allow YAML to
     // scale buffers so the controller (not the injector) becomes the bottleneck.
@@ -363,37 +374,31 @@ class BankParallelDRAMController final : public IDRAMController,
   void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override {
     m_dram = memory_system->get_ifce<IDRAM>();
     m_bank_addr_idx = m_dram->m_levels("bank");
-    m_bank_machine.setup(m_dram);
+    try {
+      m_tier_addr_idx = m_dram->m_levels("tier");
+    } catch (const std::out_of_range&) {
+      m_tier_addr_idx = -1;
+    }
+    const int configured_tiers = m_dram->get_level_size("tier");
+    m_num_tiers = configured_tiers > 0 ? static_cast<size_t>(configured_tiers) : 1;
+    const uint64_t tx_bytes_u64 =
+        (uint64_t)std::max(1, m_dram->m_internal_prefetch_size) *
+        (uint64_t)std::max(8, m_dram->m_channel_width) / 8ull;
+    m_transfer_unit_bytes =
+        static_cast<uint32_t>(std::max<uint64_t>(1ull, tx_bytes_u64));
+
     if (m_shadow_scoreboard_enable) {
       m_shadow_scoreboard.init_from_dram_org(m_dram, m_channel_id);
     }
-    m_bank_machine.attach_scoreboard(
-        (m_shadow_scoreboard_enable && m_shadow_scoreboard.valid())
-            ? &m_shadow_scoreboard
-            : nullptr);
-    m_refresh_window_cycles = detect_refresh_window_cycles();
-    s_controller_refresh_window_cycles =
-        m_refresh_window_cycles > 0
-            ? static_cast<size_t>(m_refresh_window_cycles)
-            : 0;
-    if (m_scoreboard_autoprecharge_cap > 0) {
-      try {
-        m_cmd_rd = m_dram->m_commands("RD");
-        m_cmd_wr = m_dram->m_commands("WR");
-        m_cmd_rda = m_dram->m_commands("RDA");
-        m_cmd_wra = m_dram->m_commands("WRA");
-      } catch (const std::out_of_range&) {
-        spdlog::warn(
-            "BankParallel channel {}: disable scoreboard_autoprecharge_cap={} "
-            "because DRAM does not expose RD/WR/RDA/WRA.",
-            m_channel_id, m_scoreboard_autoprecharge_cap);
-        m_scoreboard_autoprecharge_cap = 0;
-      }
-    }
-    m_bank_machine.configure_scoreboard_autoprecharge(
-        m_scoreboard_autoprecharge_cap, m_cmd_rd, m_cmd_wr, m_cmd_rda, m_cmd_wra);
 
     m_num_cores = frontend->get_num_cores();
+    s_tier_access_cmds_issued_total.assign(m_num_tiers, 0);
+    s_max_tier_access_cmds_issued_per_cycle.assign(m_num_tiers, 0);
+    s_avg_tier_access_cmds_issued_per_cycle.assign(m_num_tiers, 0.0f);
+    s_cross_tier_reqs_by_src_dst.assign(
+        m_num_tiers, std::vector<size_t>(m_num_tiers, 0));
+    s_vertical_copy_reqs_by_src_dst.assign(
+        m_num_tiers, std::vector<size_t>(m_num_tiers, 0));
 
     s_read_row_hits_per_core.resize(m_num_cores, 0);
     s_read_row_misses_per_core.resize(m_num_cores, 0);
@@ -410,15 +415,6 @@ class BankParallelDRAMController final : public IDRAMController,
     register_stat(s_write_row_misses).name("write_row_misses_{}", m_channel_id);
     register_stat(s_write_row_conflicts)
         .name("write_row_conflicts_{}", m_channel_id);
-
-    for (size_t phase = 0; phase < kNumShmemPhases; ++phase) {
-      register_stat(s_phase_row_hits[phase])
-          .name("phase{}_row_hits_{}", phase, m_channel_id);
-      register_stat(s_phase_row_misses[phase])
-          .name("phase{}_row_misses_{}", phase, m_channel_id);
-      register_stat(s_phase_row_conflicts[phase])
-          .name("phase{}_row_conflicts_{}", phase, m_channel_id);
-    }
 
     for (size_t core_id = 0; core_id < m_num_cores; core_id++) {
       register_stat(s_read_row_hits_per_core[core_id])
@@ -444,6 +440,18 @@ class BankParallelDRAMController final : public IDRAMController,
         .name("num_shadow_read_reqs_{}", m_channel_id);
     register_stat(s_num_shadow_write_reqs)
         .name("num_shadow_write_reqs_{}", m_channel_id);
+    register_stat(s_tier_local_read_reqs)
+        .name("tier_local_read_reqs_{}", m_channel_id);
+    register_stat(s_tier_local_write_reqs)
+        .name("tier_local_write_reqs_{}", m_channel_id);
+    register_stat(s_cross_tier_read_reqs)
+        .name("cross_tier_read_reqs_{}", m_channel_id);
+    register_stat(s_cross_tier_write_reqs)
+        .name("cross_tier_write_reqs_{}", m_channel_id);
+    register_stat(s_vertical_copy_read_reqs)
+        .name("vertical_copy_read_reqs_{}", m_channel_id);
+    register_stat(s_vertical_copy_write_reqs)
+        .name("vertical_copy_write_reqs_{}", m_channel_id);
     register_stat(s_queue_len).name("queue_len_{}", m_channel_id);
     register_stat(s_read_queue_len).name("read_queue_len_{}", m_channel_id);
     register_stat(s_write_queue_len).name("write_queue_len_{}", m_channel_id);
@@ -460,24 +468,6 @@ class BankParallelDRAMController final : public IDRAMController,
     for (const auto traffic_class : kTrafficClasses) {
       const size_t idx = traffic_class_index(traffic_class);
       const char* prefix = traffic_class_stat_prefix(traffic_class);
-      register_stat(s_row_hits_by_class[idx])
-          .name("{}_row_hits_{}", prefix, m_channel_id);
-      register_stat(s_row_misses_by_class[idx])
-          .name("{}_row_misses_{}", prefix, m_channel_id);
-      register_stat(s_row_conflicts_by_class[idx])
-          .name("{}_row_conflicts_{}", prefix, m_channel_id);
-      register_stat(s_read_row_hits_by_class[idx])
-          .name("{}_read_row_hits_{}", prefix, m_channel_id);
-      register_stat(s_read_row_misses_by_class[idx])
-          .name("{}_read_row_misses_{}", prefix, m_channel_id);
-      register_stat(s_read_row_conflicts_by_class[idx])
-          .name("{}_read_row_conflicts_{}", prefix, m_channel_id);
-      register_stat(s_write_row_hits_by_class[idx])
-          .name("{}_write_row_hits_{}", prefix, m_channel_id);
-      register_stat(s_write_row_misses_by_class[idx])
-          .name("{}_write_row_misses_{}", prefix, m_channel_id);
-      register_stat(s_write_row_conflicts_by_class[idx])
-          .name("{}_write_row_conflicts_{}", prefix, m_channel_id);
       register_stat(s_queue_len_by_class[idx])
           .name("{}_queue_len_{}", prefix, m_channel_id);
       register_stat(s_queue_len_avg_by_class[idx])
@@ -519,20 +509,76 @@ class BankParallelDRAMController final : public IDRAMController,
         .name("max_cmds_issued_per_cycle_{}", m_channel_id);
     register_stat(s_max_access_cmds_issued_per_cycle)
         .name("max_access_cmds_issued_per_cycle_{}", m_channel_id);
+    register_stat(s_max_shared_access_cmds_issued_per_cycle)
+        .name("max_shared_access_cmds_issued_per_cycle_{}", m_channel_id);
+    register_stat(s_max_vertical_transfer_cmds_issued_per_cycle)
+        .name("max_vertical_transfer_cmds_issued_per_cycle_{}", m_channel_id);
+    register_stat(s_cmds_issued_total).name("cmds_issued_total_{}", m_channel_id);
+    register_stat(s_access_cmds_issued_total)
+        .name("access_cmds_issued_total_{}", m_channel_id);
+    register_stat(s_local_tier_access_cmds_issued_total)
+        .name("local_tier_access_cmds_issued_total_{}", m_channel_id);
+    register_stat(s_shared_access_cmds_issued_total)
+        .name("shared_access_cmds_issued_total_{}", m_channel_id);
+    register_stat(s_vertical_transfer_cmds_issued_total)
+        .name("vertical_transfer_cmds_issued_total_{}", m_channel_id);
+    register_stat(s_cross_tier_cmds_issued_total)
+        .name("cross_tier_cmds_issued_total_{}", m_channel_id);
+    register_stat(s_vertical_copy_cmds_issued_total)
+        .name("vertical_copy_cmds_issued_total_{}", m_channel_id);
+    register_stat(s_vertical_port_busy_cycles)
+        .name("vertical_port_busy_cycles_{}", m_channel_id);
+    register_stat(s_cross_tier_transfer_cycles_total)
+        .name("cross_tier_transfer_cycles_total_{}", m_channel_id);
+    register_stat(s_vertical_copy_transfer_cycles_total)
+        .name("vertical_copy_transfer_cycles_total_{}", m_channel_id);
     register_stat(s_avg_cmds_issued_per_cycle)
         .name("avg_cmds_issued_per_cycle_{}", m_channel_id);
     register_stat(s_avg_access_cmds_issued_per_cycle)
         .name("avg_access_cmds_issued_per_cycle_{}", m_channel_id);
+    register_stat(s_avg_shared_access_cmds_issued_per_cycle)
+        .name("avg_shared_access_cmds_issued_per_cycle_{}", m_channel_id);
+    register_stat(s_avg_vertical_transfer_cmds_issued_per_cycle)
+        .name("avg_vertical_transfer_cmds_issued_per_cycle_{}", m_channel_id);
+    for (size_t tier = 0; tier < m_num_tiers; tier++) {
+      register_stat(s_tier_access_cmds_issued_total[tier])
+          .name("tier_access_cmds_issued_total_t{}_{}", tier, m_channel_id);
+      register_stat(s_max_tier_access_cmds_issued_per_cycle[tier])
+          .name("max_tier_access_cmds_issued_per_cycle_t{}_{}", tier,
+                m_channel_id);
+      register_stat(s_avg_tier_access_cmds_issued_per_cycle[tier])
+          .name("avg_tier_access_cmds_issued_per_cycle_t{}_{}", tier,
+                m_channel_id);
+      for (size_t dst_tier = 0; dst_tier < m_num_tiers; dst_tier++) {
+        register_stat(s_cross_tier_reqs_by_src_dst[tier][dst_tier])
+            .name("cross_tier_reqs_src_t{}_dst_t{}_{}", tier, dst_tier,
+                  m_channel_id);
+        register_stat(s_vertical_copy_reqs_by_src_dst[tier][dst_tier])
+            .name("vertical_copy_reqs_src_t{}_dst_t{}_{}", tier, dst_tier,
+                  m_channel_id);
+      }
+    }
+
     register_stat(s_shadow_scoreboard_diff_checks)
         .name("shadow_scoreboard_diff_checks_{}", m_channel_id);
     register_stat(s_shadow_scoreboard_rowhit_mismatches)
         .name("shadow_scoreboard_rowhit_mismatches_{}", m_channel_id);
     register_stat(s_shadow_scoreboard_rowopen_mismatches)
         .name("shadow_scoreboard_rowopen_mismatches_{}", m_channel_id);
+    register_stat(s_shadow_scoreboard_prereq_checks)
+        .name("shadow_scoreboard_prereq_checks_{}", m_channel_id);
+    register_stat(s_shadow_scoreboard_prereq_mismatches)
+        .name("shadow_scoreboard_prereq_mismatches_{}", m_channel_id);
     register_stat(s_shadow_scoreboard_ready_checks)
         .name("shadow_scoreboard_ready_checks_{}", m_channel_id);
     register_stat(s_shadow_scoreboard_ready_mismatches)
         .name("shadow_scoreboard_ready_mismatches_{}", m_channel_id);
+    register_stat(s_shadow_scoreboard_ready_oracle_blocked_while_scoreboard_ready)
+        .name("shadow_scoreboard_ready_oracle_blocked_while_scoreboard_ready_{}",
+              m_channel_id);
+    register_stat(s_shadow_scoreboard_ready_oracle_ready_while_scoreboard_blocked)
+        .name("shadow_scoreboard_ready_oracle_ready_while_scoreboard_blocked_{}",
+              m_channel_id);
     register_stat(s_shadow_scoreboard_ready_mismatch_open)
         .name("shadow_scoreboard_ready_mismatch_open_{}", m_channel_id);
     register_stat(s_shadow_scoreboard_ready_mismatch_access)
@@ -542,54 +588,9 @@ class BankParallelDRAMController final : public IDRAMController,
     register_stat(s_shadow_scoreboard_ready_mismatch_other)
         .name("shadow_scoreboard_ready_mismatch_other_{}", m_channel_id);
     register_stat(s_shadow_scoreboard_ready_blocked_by_scoreboard)
-        .name("shadow_scoreboard_ready_blocked_by_scoreboard_{}",
-              m_channel_id);
+        .name("shadow_scoreboard_ready_blocked_by_scoreboard_{}", m_channel_id);
     register_stat(s_shadow_scoreboard_ready_blocked_by_oracle)
         .name("shadow_scoreboard_ready_blocked_by_oracle_{}", m_channel_id);
-    register_stat(s_shadow_scoreboard_ready_oracle_blocked_while_scoreboard_ready)
-        .name("shadow_scoreboard_ready_oracle_blocked_while_scoreboard_ready_{}",
-              m_channel_id);
-    register_stat(s_shadow_scoreboard_ready_oracle_ready_while_scoreboard_blocked)
-        .name("shadow_scoreboard_ready_oracle_ready_while_scoreboard_blocked_{}",
-              m_channel_id);
-    register_stat(s_shadow_scoreboard_prereq_checks)
-        .name("shadow_scoreboard_prereq_checks_{}", m_channel_id);
-    register_stat(s_shadow_scoreboard_prereq_mismatches)
-        .name("shadow_scoreboard_prereq_mismatches_{}", m_channel_id);
-    register_stat(s_shadow_scoreboard_refresh_enter_events)
-        .name("shadow_scoreboard_refresh_enter_events_{}", m_channel_id);
-    register_stat(s_controller_refresh_pending_events)
-        .name("controller_refresh_pending_events_{}", m_channel_id);
-    register_stat(s_controller_refresh_enter_events)
-        .name("controller_refresh_enter_events_{}", m_channel_id);
-    register_stat(s_controller_refresh_exit_events)
-        .name("controller_refresh_exit_events_{}", m_channel_id);
-    register_stat(s_controller_refresh_pending_cycles)
-        .name("controller_refresh_pending_cycles_{}", m_channel_id);
-    register_stat(s_controller_refresh_active_cycles)
-        .name("controller_refresh_active_cycles_{}", m_channel_id);
-    register_stat(s_controller_refresh_epoch)
-        .name("controller_refresh_epoch_{}", m_channel_id);
-    register_stat(s_controller_refresh_scope_kind_last)
-        .name("controller_refresh_scope_kind_last_{}", m_channel_id);
-    register_stat(s_controller_refresh_window_cycles)
-        .name("controller_refresh_window_cycles_{}", m_channel_id);
-    register_stat(s_shadow_scoreboard_refreshing_banks_peak)
-        .name("shadow_scoreboard_refreshing_banks_peak_{}", m_channel_id);
-    register_stat(s_shadow_scoreboard_pending_banks_peak)
-        .name("shadow_scoreboard_pending_banks_peak_{}", m_channel_id);
-    register_stat(s_scoreboard_forced_autoprecharge)
-        .name("scoreboard_forced_autoprecharge_{}", m_channel_id);
-    register_stat(s_bankmachine_transition_open)
-        .name("bankmachine_transition_open_{}", m_channel_id);
-    register_stat(s_bankmachine_transition_access)
-        .name("bankmachine_transition_access_{}", m_channel_id);
-    register_stat(s_bankmachine_transition_close)
-        .name("bankmachine_transition_close_{}", m_channel_id);
-    register_stat(s_bankmachine_transition_refresh)
-        .name("bankmachine_transition_refresh_{}", m_channel_id);
-    register_stat(s_bankmachine_transition_other)
-        .name("bankmachine_transition_other_{}", m_channel_id);
   };
 
   bool send(Request& req) override {
@@ -632,6 +633,8 @@ class BankParallelDRAMController final : public IDRAMController,
       }
     }
 
+    note_request_path_stats(req);
+
     if (req.type_id == Request::Type::Read) {
       auto compare_addr = [req](const Request& wreq) {
         return wreq.addr == req.addr;
@@ -670,12 +673,10 @@ class BankParallelDRAMController final : public IDRAMController,
     const bool ok = m_priority_buffer.enqueue(req);
     if (ok) {
       adjust_counted_queue_occupancy(req, +1);
-      if (m_dram->m_command_meta(req.final_command).is_refreshing) {
-        note_refresh_scope_pending(req.final_command, req.addr_vec);
-        if (m_shadow_scoreboard_enable && m_shadow_scoreboard.valid()) {
-          m_shadow_scoreboard.on_refresh_scope_pending_from_command(
-              m_dram, req.final_command, req.addr_vec, m_clk);
-        }
+      if (m_shadow_scoreboard_enable && m_shadow_scoreboard.valid() &&
+          m_dram->m_command_meta(req.final_command).is_refreshing) {
+        m_shadow_scoreboard.on_refresh_scope_pending_from_command(
+            m_dram, req.final_command, req.addr_vec, m_clk);
       }
     }
     return ok;
@@ -695,8 +696,7 @@ class BankParallelDRAMController final : public IDRAMController,
     return m_dram->get_preq_command(final_command, addr_vec);
   }
 
-  bool is_command_ready(int command,
-                        const AddrVec_t& addr_vec) const override {
+  bool is_command_ready(int command, const AddrVec_t& addr_vec) const override {
     if (m_shadow_scoreboard_enable && m_shadow_scoreboard.valid()) {
       return m_shadow_scoreboard.is_command_ready(m_dram, command, addr_vec,
                                                  m_clk);
@@ -728,8 +728,8 @@ class BankParallelDRAMController final : public IDRAMController,
       return false;
     }
 
-    const TelemetryResult telemetry =
-        m_shadow_scoreboard.query_telemetry(m_dram, final_command, addr_vec, m_clk);
+    const TelemetryResult telemetry = m_shadow_scoreboard.query_telemetry(
+        m_dram, final_command, addr_vec, m_clk);
     if (!telemetry.valid) {
       return false;
     }
@@ -760,14 +760,13 @@ class BankParallelDRAMController final : public IDRAMController,
                   (queue_occupancy * 1000ULL + queue_capacity / 2ULL) /
                   queue_capacity);
     result.refresh_epoch = telemetry.refresh_epoch;
-    result.refresh_mode = m_refresh_window_cycles > 0
-                              ? ControllerRefreshMode::kStaticNormal
-                              : ControllerRefreshMode::kUnknown;
+    result.refresh_mode = ControllerRefreshMode::kUnknown;
     return true;
   }
 
   void tick() override {
     m_clk++;
+    retire_completed_vertical_transfers();
 
     s_queue_len +=
         m_read_buffer.size() + m_write_buffer.size() + m_priority_buffer.size() +
@@ -783,49 +782,40 @@ class BankParallelDRAMController final : public IDRAMController,
     serve_completed_pending();
 
     m_refresh->tick();
-    tick_refresh_lifecycle_state();
-    sample_shadow_refresh_state_peaks();
 
     std::unordered_set<std::string> used_access_banks;
-    used_access_banks.reserve(std::max<uint32_t>(1, m_access_ports) * 2);
+    used_access_banks.reserve(std::max<uint32_t>(1, m_shared_access_ports) * 2);
+    std::vector<uint32_t> tier_access_cmds_issued_this_cycle(m_num_tiers, 0);
 
     const uint32_t issue_budget = std::max<uint32_t>(1, m_cmd_issue_width);
-    const uint32_t access_budget = std::max<uint32_t>(1, m_access_ports);
+    const uint32_t shared_access_budget =
+        std::max<uint32_t>(1, m_shared_access_ports);
+    const uint32_t tier_access_budget =
+        std::max<uint32_t>(1, m_tier_access_ports);
     uint32_t cmds_issued_this_cycle = 0;
     uint32_t access_cmds_issued_this_cycle = 0;
+    uint32_t shared_access_cmds_issued_this_cycle = 0;
+    uint32_t vertical_transfer_cmds_issued_this_cycle = 0;
     uint32_t background_cmds_issued_this_cycle = 0;
     uint32_t shadow_cmds_issued_this_cycle = 0;
     for (uint32_t issued = 0; issued < issue_budget; ++issued) {
       ReqBuffer::iterator req_it;
       ReqBuffer* buffer = nullptr;
-      const bool allow_access = (access_cmds_issued_this_cycle < access_budget);
+      const bool allow_access =
+          (shared_access_cmds_issued_this_cycle < shared_access_budget);
       bool request_found = schedule_request_filtered(
           req_it, buffer, used_access_banks, allow_access,
-          background_cmds_issued_this_cycle, shadow_cmds_issued_this_cycle);
+          background_cmds_issued_this_cycle, shadow_cmds_issued_this_cycle,
+          tier_access_cmds_issued_this_cycle, tier_access_budget);
       if (!request_found) {
         break;
       }
 
       m_rowpolicy->update(request_found, req_it);
 
-      const IssueCommandPlan issue_plan = build_issue_command_plan(req_it);
-      if (issue_plan.issue_command < 0) {
-        break;
-      }
-      if (!is_command_ready_for_issue(issue_plan.issue_command,
-                                      req_it->addr_vec)) {
-        break;
-      }
-      if (m_dram->m_command_meta(issue_plan.issue_command).is_closing &&
-          has_active_rowgroup_conflict(req_it->addr_vec)) {
-        break;
-      }
-
-      req_it->command = issue_plan.issue_command;
       for (auto plugin : m_plugins) {
         plugin->update(request_found, req_it);
       }
-      req_it->command = issue_plan.issue_command;
 
       if (req_it->is_stat_updated == false) {
         update_request_stats(req_it);
@@ -833,21 +823,9 @@ class BankParallelDRAMController final : public IDRAMController,
 
       const ExternalTrafficClass issued_traffic_class =
           get_external_traffic_class(*req_it);
-      const int command = issue_plan.issue_command;
-      const bool is_refreshing_command =
-          m_dram->m_command_meta(command).is_refreshing;
+      const int command = req_it->command;
       m_dram->issue_command(command, req_it->addr_vec);
-      if (is_refreshing_command) {
-        note_refresh_scope_enter(command, req_it->addr_vec);
-      }
-      if (issue_plan.forced_autoprecharge) {
-        s_scoreboard_forced_autoprecharge++;
-      }
-      note_bankmachine_transition(issue_plan.transition);
       if (m_shadow_scoreboard_enable && m_shadow_scoreboard.valid()) {
-        if (is_refreshing_command) {
-          s_shadow_scoreboard_refresh_enter_events++;
-        }
         m_shadow_scoreboard.on_issue_command(m_dram, command, req_it->addr_vec,
                                              m_clk);
         const ShadowDiffResult diff = m_shadow_scoreboard.diff_against_dram(
@@ -863,12 +841,16 @@ class BankParallelDRAMController final : public IDRAMController,
           if ((!diff.row_hit_match || !diff.row_open_match) &&
               (m_shadow_scoreboard_log_mismatch ||
                m_shadow_scoreboard_fail_fast)) {
-            const std::string msg = fmt::format(
-                "BankParallel shadow scoreboard mismatch ch={} cmd={} final={} "
-                "addr={} row_hit(sb/dram)={}/{} row_open(sb/dram)={}/{}",
-                m_channel_id, command, req_it->final_command, req_it->addr,
-                diff.scoreboard_row_hit, diff.dram_row_hit,
-                diff.scoreboard_row_open, diff.dram_row_open);
+            std::ostringstream oss;
+            oss << "TieredM3D shadow scoreboard mismatch ch=" << m_channel_id
+                << " cmd=" << command << " final=" << req_it->final_command
+                << " addr=" << req_it->addr
+                << " bank=" << bank_key(req_it->addr_vec)
+                << " row_hit(sb/dram)=" << diff.scoreboard_row_hit << "/"
+                << diff.dram_row_hit
+                << " row_open(sb/dram)=" << diff.scoreboard_row_open << "/"
+                << diff.dram_row_open;
+            const std::string msg = oss.str();
             if (m_shadow_scoreboard_log_mismatch) {
               spdlog::warn("{}", msg);
             }
@@ -888,21 +870,34 @@ class BankParallelDRAMController final : public IDRAMController,
       if (m_dram->m_command_meta(command).is_accessing) {
         used_access_banks.insert(bank_key(req_it->addr_vec));
         access_cmds_issued_this_cycle++;
+        shared_access_cmds_issued_this_cycle++;
+        const int tier = request_access_tier(*req_it);
+        if (tier >= 0 &&
+            static_cast<size_t>(tier) < tier_access_cmds_issued_this_cycle.size()) {
+          tier_access_cmds_issued_this_cycle[tier]++;
+        }
+        if (requires_vertical_transfer(*req_it)) {
+          vertical_transfer_cmds_issued_this_cycle++;
+          const Clk_t occupancy_cycles =
+              vertical_transfer_occupancy_cycles(*req_it);
+          if (is_vertical_copy_path(*req_it)) {
+            s_vertical_copy_cmds_issued_total++;
+            s_vertical_copy_transfer_cycles_total +=
+                static_cast<size_t>(std::max<Clk_t>(0, occupancy_cycles));
+          } else {
+            s_cross_tier_cmds_issued_total++;
+            s_cross_tier_transfer_cycles_total +=
+                static_cast<size_t>(std::max<Clk_t>(0, occupancy_cycles));
+          }
+          reserve_vertical_transfer(*req_it);
+        } else {
+          s_local_tier_access_cmds_issued_total++;
+        }
       }
 
-      if (issue_plan.completes_request) {
+      if (command == req_it->final_command) {
         Request completed_req = *req_it;
-        if (req_it->type_id == Request::Type::Read) {
-          completed_req.depart = m_clk + m_dram->m_read_latency;
-        } else if (req_it->type_id == Request::Type::Write) {
-          if (m_write_completion_mode == WriteCompletionMode::kPosted) {
-            completed_req.depart = m_clk + 1;
-          } else {
-            Clk_t lat = m_dram->m_write_latency;
-            if (lat < 1) lat = 1;
-            completed_req.depart = m_clk + lat;
-          }
-        }
+        completed_req.depart = completion_depart_cycle(completed_req);
         move_request_to_pending(completed_req, buffer);
         buffer->remove(req_it);
       } else if (m_dram->m_command_meta(command).is_opening) {
@@ -916,206 +911,32 @@ class BankParallelDRAMController final : public IDRAMController,
 
     s_cmds_issued_total += cmds_issued_this_cycle;
     s_access_cmds_issued_total += access_cmds_issued_this_cycle;
+    s_shared_access_cmds_issued_total += shared_access_cmds_issued_this_cycle;
+    s_vertical_transfer_cmds_issued_total +=
+        vertical_transfer_cmds_issued_this_cycle;
     s_max_cmds_issued_per_cycle =
         std::max<size_t>(s_max_cmds_issued_per_cycle, cmds_issued_this_cycle);
     s_max_access_cmds_issued_per_cycle = std::max<size_t>(
         s_max_access_cmds_issued_per_cycle, access_cmds_issued_this_cycle);
+    s_max_shared_access_cmds_issued_per_cycle =
+        std::max<size_t>(s_max_shared_access_cmds_issued_per_cycle,
+                         shared_access_cmds_issued_this_cycle);
+    s_max_vertical_transfer_cmds_issued_per_cycle = std::max<size_t>(
+        s_max_vertical_transfer_cmds_issued_per_cycle,
+        vertical_transfer_cmds_issued_this_cycle);
+    for (size_t tier = 0; tier < m_num_tiers; tier++) {
+      s_tier_access_cmds_issued_total[tier] +=
+          tier_access_cmds_issued_this_cycle[tier];
+      s_max_tier_access_cmds_issued_per_cycle[tier] = std::max<size_t>(
+          s_max_tier_access_cmds_issued_per_cycle[tier],
+          tier_access_cmds_issued_this_cycle[tier]);
+    }
+    if (!m_active_vertical_transfer_releases.empty()) {
+      s_vertical_port_busy_cycles++;
+    }
   };
 
  private:
-  ProbeResult probe_row_state(ReqBuffer::iterator& req) const {
-    if (m_dram->m_command_meta(req->final_command).is_refreshing) {
-      ProbeResult refresh_probe {};
-      refresh_probe.valid = false;
-      refresh_probe.refreshing = true;
-      return refresh_probe;
-    }
-
-    if (m_shadow_scoreboard_enable && m_shadow_scoreboard.valid()) {
-      const ProbeResult probe =
-          m_shadow_scoreboard.probe(m_dram, req->final_command, req->addr_vec);
-      if (probe.valid) {
-        return probe;
-      }
-    }
-
-    ProbeResult fallback {};
-    fallback.valid = true;
-    fallback.row_hit =
-        m_dram->check_rowbuffer_hit(req->final_command, req->addr_vec);
-    fallback.row_open =
-        m_dram->check_node_open(req->final_command, req->addr_vec);
-    fallback.refreshing = false;
-    return fallback;
-  }
-
-  bool is_row_hit(ReqBuffer::iterator& req) const {
-    return probe_row_state(req).row_hit;
-  }
-
-  bool is_row_open(ReqBuffer::iterator& req) const {
-    return probe_row_state(req).row_open;
-  }
-
-  IssueCommandPlan build_issue_command_plan(ReqBuffer::iterator& req_it) const {
-    const ProbeResult probe = probe_row_state(req_it);
-    return m_bank_machine.build_issue_plan(*req_it, probe, m_clk);
-  }
-
-  void note_bankmachine_transition(BankMachine::TransitionType transition) {
-    switch (transition) {
-      case BankMachine::TransitionType::kOpen:
-        s_bankmachine_transition_open++;
-        break;
-      case BankMachine::TransitionType::kAccess:
-        s_bankmachine_transition_access++;
-        break;
-      case BankMachine::TransitionType::kClose:
-        s_bankmachine_transition_close++;
-        break;
-      case BankMachine::TransitionType::kRefresh:
-        s_bankmachine_transition_refresh++;
-        break;
-      case BankMachine::TransitionType::kOther:
-      case BankMachine::TransitionType::kInvalid:
-      default:
-        s_bankmachine_transition_other++;
-        break;
-    }
-  }
-
-  Clk_t detect_refresh_window_cycles() const {
-    if (!m_dram) return -1;
-
-    constexpr std::array<const char*, 7> kRefreshTimingNames = {
-        "nRFC", "nRFCab", "nRFCpb", "nRFC1", "nRFC2", "nRFCSB", "nRFCPB",
-    };
-    for (const char* name : kRefreshTimingNames) {
-      try {
-        const int value = m_dram->m_timing_vals(name);
-        if (value > 0) {
-          return static_cast<Clk_t>(value);
-        }
-      } catch (const std::out_of_range&) {
-      }
-    }
-
-    return -1;
-  }
-
-  RefreshScopeKind refresh_scope_kind_from_command(int command) const {
-    if (!m_dram) return RefreshScopeKind::kNone;
-    try {
-      const int scope_level = m_dram->m_command_scopes(command);
-      const std::string_view scope_name = m_dram->m_levels(scope_level);
-      if (scope_name == "bank") return RefreshScopeKind::kBank;
-      if (scope_name == "bankgroup") return RefreshScopeKind::kBankGroup;
-      if (scope_name == "rank") return RefreshScopeKind::kRank;
-      if (scope_name == "channel") return RefreshScopeKind::kChannel;
-    } catch (const std::out_of_range&) {
-      return RefreshScopeKind::kNone;
-    }
-    return RefreshScopeKind::kNone;
-  }
-
-  static size_t refresh_scope_kind_to_stat(RefreshScopeKind scope_kind) {
-    return static_cast<size_t>(scope_kind);
-  }
-
-  void note_refresh_scope_pending(int command, const AddrVec_t& scope_addr_vec) {
-    m_refresh_state.pending = true;
-    m_refresh_state.scope_kind = refresh_scope_kind_from_command(command);
-    m_refresh_state.scope_addr_vec = scope_addr_vec;
-    m_refresh_state.pending_since_cycle = m_clk;
-    s_controller_refresh_pending_events++;
-    s_controller_refresh_scope_kind_last =
-        refresh_scope_kind_to_stat(m_refresh_state.scope_kind);
-  }
-
-  void note_refresh_scope_exit(const AddrVec_t& scope_addr_vec,
-                               RefreshScopeKind scope_kind) {
-    if (!m_refresh_state.active) return;
-
-    m_refresh_state.active = false;
-    m_refresh_state.pending = false;
-    m_refresh_state.active_since_cycle = -1;
-    m_refresh_state.active_until_cycle = -1;
-    m_refresh_state.scope_addr_vec = scope_addr_vec;
-    m_refresh_state.scope_kind = scope_kind;
-    s_controller_refresh_exit_events++;
-    s_controller_refresh_scope_kind_last =
-        refresh_scope_kind_to_stat(scope_kind);
-
-    if (m_shadow_scoreboard_enable && m_shadow_scoreboard.valid()) {
-      m_shadow_scoreboard.on_refresh_exit(scope_kind, scope_addr_vec, m_clk);
-    }
-  }
-
-  void note_refresh_scope_enter(int command, const AddrVec_t& scope_addr_vec) {
-    if (m_refresh_state.active) {
-      note_refresh_scope_exit(m_refresh_state.scope_addr_vec,
-                              m_refresh_state.scope_kind);
-    }
-
-    m_refresh_state.pending = false;
-    m_refresh_state.active = true;
-    m_refresh_state.scope_kind = refresh_scope_kind_from_command(command);
-    m_refresh_state.scope_addr_vec = scope_addr_vec;
-    m_refresh_state.active_since_cycle = m_clk;
-    m_refresh_state.active_until_cycle =
-        (m_refresh_window_cycles > 0) ? (m_clk + m_refresh_window_cycles) : -1;
-    m_refresh_state.epoch++;
-
-    s_controller_refresh_enter_events++;
-    s_controller_refresh_epoch = static_cast<size_t>(m_refresh_state.epoch);
-    s_controller_refresh_scope_kind_last =
-        refresh_scope_kind_to_stat(m_refresh_state.scope_kind);
-  }
-
-  void tick_refresh_lifecycle_state() {
-    if (m_refresh_state.pending) {
-      s_controller_refresh_pending_cycles++;
-    }
-    if (!m_refresh_state.active) {
-      return;
-    }
-
-    s_controller_refresh_active_cycles++;
-    if (m_refresh_state.active_until_cycle >= 0 &&
-        m_clk >= m_refresh_state.active_until_cycle) {
-      note_refresh_scope_exit(m_refresh_state.scope_addr_vec,
-                              m_refresh_state.scope_kind);
-    }
-  }
-
-  void sample_shadow_refresh_state_peaks() {
-    if (!(m_shadow_scoreboard_enable && m_shadow_scoreboard.valid())) return;
-    s_shadow_scoreboard_refreshing_banks_peak = std::max<size_t>(
-        s_shadow_scoreboard_refreshing_banks_peak,
-        m_shadow_scoreboard.count_refreshing_banks());
-    s_shadow_scoreboard_pending_banks_peak = std::max<size_t>(
-        s_shadow_scoreboard_pending_banks_peak,
-        m_shadow_scoreboard.count_refresh_pending_banks());
-  }
-
-  bool has_active_rowgroup_conflict(const AddrVec_t& rowgroup) {
-    for (auto it = m_active_buffer.begin(); it != m_active_buffer.end(); ++it) {
-      const auto& active_rowgroup = it->addr_vec;
-      bool is_matching = true;
-      for (int i = 0; i < m_bank_addr_idx + 1; i++) {
-        if (active_rowgroup[i] != rowgroup[i] && active_rowgroup[i] != -1 &&
-            rowgroup[i] != -1) {
-          is_matching = false;
-          break;
-        }
-      }
-      if (is_matching) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   bool is_counted_buffer(const ReqBuffer* buffer) const {
     return buffer == &m_read_buffer || buffer == &m_write_buffer ||
            buffer == &m_priority_buffer;
@@ -1222,36 +1043,35 @@ class BankParallelDRAMController final : public IDRAMController,
         std::max(s_max_queue_wait_cycles_by_class[traffic_idx], wait_cycles);
     note_qos_age_promotion(*req);
 
-    const ProbeResult probe = probe_row_state(req);
-    const bool row_hit = probe.row_hit;
-    const bool row_open = (!row_hit && probe.row_open);
-    const size_t phase_idx = shmem_phase_index(*req);
+    bool row_hit = false;
+    bool row_open = false;
+    if (m_dram) {
+      int rowbuffer_state = 0;
+      if (probe_rowbuffer(req->final_command, req->addr_vec, rowbuffer_state)) {
+        row_hit = (rowbuffer_state == 1);
+        row_open = (rowbuffer_state == 2);
+      } else {
+        row_hit = m_dram->check_rowbuffer_hit(req->final_command, req->addr_vec);
+        row_open = m_dram->check_node_open(req->final_command, req->addr_vec);
+      }
+    }
 
     if (req->type_id == Request::Type::Read) {
       if (row_hit) {
         s_read_row_hits++;
         s_row_hits++;
-        s_phase_row_hits[phase_idx]++;
-        s_read_row_hits_by_class[traffic_idx]++;
-        s_row_hits_by_class[traffic_idx]++;
         if (is_valid_source_id(*req, m_num_cores)) {
           s_read_row_hits_per_core[req->source_id]++;
         }
       } else if (row_open) {
         s_read_row_conflicts++;
         s_row_conflicts++;
-        s_phase_row_conflicts[phase_idx]++;
-        s_read_row_conflicts_by_class[traffic_idx]++;
-        s_row_conflicts_by_class[traffic_idx]++;
         if (is_valid_source_id(*req, m_num_cores)) {
           s_read_row_conflicts_per_core[req->source_id]++;
         }
       } else {
         s_read_row_misses++;
         s_row_misses++;
-        s_phase_row_misses[phase_idx]++;
-        s_read_row_misses_by_class[traffic_idx]++;
-        s_row_misses_by_class[traffic_idx]++;
         if (is_valid_source_id(*req, m_num_cores)) {
           s_read_row_misses_per_core[req->source_id]++;
         }
@@ -1260,21 +1080,12 @@ class BankParallelDRAMController final : public IDRAMController,
       if (row_hit) {
         s_write_row_hits++;
         s_row_hits++;
-        s_phase_row_hits[phase_idx]++;
-        s_write_row_hits_by_class[traffic_idx]++;
-        s_row_hits_by_class[traffic_idx]++;
       } else if (row_open) {
         s_write_row_conflicts++;
         s_row_conflicts++;
-        s_phase_row_conflicts[phase_idx]++;
-        s_write_row_conflicts_by_class[traffic_idx]++;
-        s_row_conflicts_by_class[traffic_idx]++;
       } else {
         s_write_row_misses++;
         s_row_misses++;
-        s_phase_row_misses[phase_idx]++;
-        s_write_row_misses_by_class[traffic_idx]++;
-        s_row_misses_by_class[traffic_idx]++;
       }
     }
   }
@@ -1338,6 +1149,138 @@ class BankParallelDRAMController final : public IDRAMController,
     return oss.str();
   }
 
+  int tier_id(const AddrVec_t& addr_vec) const {
+    if (m_tier_addr_idx < 0 ||
+        m_tier_addr_idx >= static_cast<int>(addr_vec.size())) {
+      return 0;
+    }
+    return std::max(0, addr_vec[m_tier_addr_idx]);
+  }
+
+  int explicit_source_tier(const Request& req) const {
+    if (req.source_tier_hint < 0) {
+      return -1;
+    }
+    return clamp_tier_index(req.source_tier_hint);
+  }
+
+  int explicit_destination_tier(const Request& req) const {
+    if (req.destination_tier_hint >= 0) {
+      return clamp_tier_index(req.destination_tier_hint);
+    }
+    if (req.tier_hint >= 0) {
+      return clamp_tier_index(req.tier_hint);
+    }
+    return -1;
+  }
+
+  bool is_vertical_copy_path(const Request& req) const {
+    return req.path_class == Request::PathClass::VerticalCopy;
+  }
+
+  int clamp_tier_index(int tier) const {
+    if (m_num_tiers == 0) {
+      return 0;
+    }
+    if (tier < 0) {
+      return 0;
+    }
+    const int max_tier = static_cast<int>(m_num_tiers - 1);
+    return std::min(tier, max_tier);
+  }
+
+  int request_destination_tier(const Request& req) const {
+    const int explicit_dst = explicit_destination_tier(req);
+    if (explicit_dst >= 0) {
+      return explicit_dst;
+    }
+    const int explicit_src = explicit_source_tier(req);
+    if (explicit_src >= 0 && req.path_class == Request::PathClass::LocalAccess) {
+      return explicit_src;
+    }
+    return clamp_tier_index(tier_id(req.addr_vec));
+  }
+
+  bool is_cross_tier_path(const Request& req) const {
+    if (req.path_class == Request::PathClass::LocalAccess) {
+      return false;
+    }
+    if (is_vertical_copy_path(req)) {
+      return false;
+    }
+    if (req.path_class == Request::PathClass::CrossTierAccess) {
+      return true;
+    }
+    const int explicit_src = explicit_source_tier(req);
+    const int explicit_dst = explicit_destination_tier(req);
+    if (explicit_src >= 0 && explicit_dst >= 0) {
+      return explicit_src != explicit_dst;
+    }
+    return request_destination_tier(req) > 0;
+  }
+
+  int request_source_tier(const Request& req) const {
+    const int explicit_src = explicit_source_tier(req);
+    if (explicit_src >= 0) {
+      return explicit_src;
+    }
+    const int dst_tier = request_destination_tier(req);
+    if (req.path_class == Request::PathClass::LocalAccess) {
+      return dst_tier;
+    }
+    if (req.path_class == Request::PathClass::CrossTierAccess ||
+        req.path_class == Request::PathClass::VerticalCopy) {
+      return 0;
+    }
+    return dst_tier > 0 ? 0 : dst_tier;
+  }
+
+  int request_access_tier(const Request& req) const {
+    const int explicit_dst = explicit_destination_tier(req);
+    if (explicit_dst >= 0) {
+      return explicit_dst;
+    }
+    return clamp_tier_index(tier_id(req.addr_vec));
+  }
+
+  void note_request_path_stats(const Request& req) {
+    const int src_tier = clamp_tier_index(request_source_tier(req));
+    const int dst_tier = clamp_tier_index(request_destination_tier(req));
+
+    if (is_vertical_copy_path(req)) {
+      if (req.type_id == Request::Type::Read) {
+        s_vertical_copy_read_reqs++;
+      } else if (req.type_id == Request::Type::Write) {
+        s_vertical_copy_write_reqs++;
+      }
+      s_vertical_copy_reqs_by_src_dst[src_tier][dst_tier]++;
+      return;
+    }
+
+    if (is_cross_tier_path(req)) {
+      if (req.type_id == Request::Type::Read) {
+        s_cross_tier_read_reqs++;
+      } else if (req.type_id == Request::Type::Write) {
+        s_cross_tier_write_reqs++;
+      }
+      s_cross_tier_reqs_by_src_dst[src_tier][dst_tier]++;
+      return;
+    }
+
+    if (req.type_id == Request::Type::Read) {
+      s_tier_local_read_reqs++;
+    } else if (req.type_id == Request::Type::Write) {
+      s_tier_local_write_reqs++;
+    }
+  }
+
+  bool requires_vertical_transfer(const Request& req) const {
+    if (!m_dram->m_command_meta(req.command).is_accessing) {
+      return false;
+    }
+    return is_vertical_copy_path(req) || is_cross_tier_path(req);
+  }
+
   bool violates_access_bank_parallelism(
       const Request& req,
       const std::unordered_set<std::string>& used_access_banks) const {
@@ -1348,132 +1291,31 @@ class BankParallelDRAMController final : public IDRAMController,
            used_access_banks.end();
   }
 
-  struct BankCandidate {
-    ReqBuffer* buffer = nullptr;
-    ReqBuffer::iterator it {};
-    std::string bank;
-  };
-
-  bool candidate_rhs_better(const BankCandidate& lhs, const BankCandidate& rhs,
-                            bool prioritize_traffic_class,
-                            bool count_foreground_qos_win) {
-    if (prioritize_traffic_class && prefer_request_qos(*rhs.it, *lhs.it) &&
-        !prefer_request_qos(*lhs.it, *rhs.it)) {
-      if (count_foreground_qos_win &&
-          get_external_traffic_class(*rhs.it) ==
-              ExternalTrafficClass::kForeground &&
-          get_external_traffic_class(*lhs.it) !=
-              ExternalTrafficClass::kForeground) {
-        s_foreground_qos_wins++;
-      }
-      return true;
+  bool violates_tier_access_parallelism(
+      const Request& req,
+      const std::vector<uint32_t>& tier_access_cmds_issued_this_cycle,
+      uint32_t tier_access_budget) const {
+    if (!m_dram->m_command_meta(req.command).is_accessing) {
+      return false;
     }
-    ReqBuffer::iterator better = m_scheduler->compare(lhs.it, rhs.it);
-    return &(*better) == &(*rhs.it);
+    const int tier = request_access_tier(req);
+    if (tier < 0 ||
+        static_cast<size_t>(tier) >= tier_access_cmds_issued_this_cycle.size()) {
+      return false;
+    }
+    return tier_access_cmds_issued_this_cycle[tier] >= tier_access_budget;
   }
 
-  void collect_bank_candidates_from_buffer(
-      ReqBuffer& buffer, ReqBuffer* buffer_ptr,
-      const std::unordered_set<std::string>& used_access_banks,
-      bool allow_access, bool prioritize_traffic_class,
-      uint32_t background_cmds_issued_this_cycle,
-      uint32_t shadow_cmds_issued_this_cycle,
-      std::unordered_map<std::string, BankCandidate>& bank_candidates) {
-    for (auto& req : buffer) {
-      const int scoreboard_cmd =
-          get_prereq_command(req.final_command, req.addr_vec);
-      req.command = scoreboard_cmd;
-
-      if (m_shadow_scoreboard_enable && m_shadow_scoreboard.valid()) {
-        s_shadow_scoreboard_prereq_checks++;
-        const int oracle_cmd =
-            m_dram->get_preq_command(req.final_command, req.addr_vec);
-        if (oracle_cmd != scoreboard_cmd) {
-          s_shadow_scoreboard_prereq_mismatches++;
-          if (m_shadow_scoreboard_log_mismatch ||
-              m_shadow_scoreboard_fail_fast) {
-            std::ostringstream oss;
-            oss << "BankParallel channel " << m_channel_id
-                << ": prereq mismatch final=" << req.final_command
-                << " scoreboard=" << scoreboard_cmd << " oracle=" << oracle_cmd
-                << " bank=" << bank_key(req.addr_vec);
-            const std::string msg = oss.str();
-            if (m_shadow_scoreboard_log_mismatch) {
-              spdlog::warn("{}", msg);
-            }
-            if (m_shadow_scoreboard_fail_fast) {
-              throw std::runtime_error(msg);
-            }
-          }
-        }
-      }
+  bool violates_vertical_transfer_budget(
+      const Request& req) const {
+    if (!requires_vertical_transfer(req)) {
+      return false;
     }
-
-    for (auto it = buffer.begin(); it != buffer.end(); ++it) {
-      if (m_dram->m_command_meta(it->command).is_accessing && !allow_access) {
-        continue;
-      }
-      if (violates_access_bank_parallelism(*it, used_access_banks)) {
-        continue;
-      }
-      if (is_qos_budget_blocked(*it, background_cmds_issued_this_cycle,
-                                shadow_cmds_issued_this_cycle)) {
-        note_qos_budget_blocked(*it);
-        continue;
-      }
-      if (!is_command_ready_for_issue(it->command, it->addr_vec)) {
-        continue;
-      }
-
-      const std::string bank = bank_key(it->addr_vec);
-      BankCandidate incoming {buffer_ptr, it, bank};
-      auto found = bank_candidates.find(bank);
-      if (found == bank_candidates.end()) {
-        bank_candidates.emplace(bank, incoming);
-        continue;
-      }
-      if (candidate_rhs_better(found->second, incoming, prioritize_traffic_class,
-                               false)) {
-        found->second = incoming;
-      }
+    if (m_vertical_transfer_ports == 0) {
+      return false;
     }
-  }
-
-  bool select_best_ready_from_buffers(
-      const std::vector<ReqBuffer*>& buffers,
-      const std::unordered_set<std::string>& used_access_banks,
-      bool allow_access, bool prioritize_traffic_class,
-      uint32_t background_cmds_issued_this_cycle,
-      uint32_t shadow_cmds_issued_this_cycle, ReqBuffer::iterator& req_it,
-      ReqBuffer*& req_buffer) {
-    std::unordered_map<std::string, BankCandidate> bank_candidates;
-    bank_candidates.reserve(32);
-    for (auto* buffer : buffers) {
-      if (buffer == nullptr || buffer->size() == 0) continue;
-      collect_bank_candidates_from_buffer(
-          *buffer, buffer, used_access_banks, allow_access,
-          prioritize_traffic_class, background_cmds_issued_this_cycle,
-          shadow_cmds_issued_this_cycle, bank_candidates);
-    }
-
-    bool found = false;
-    BankCandidate best {};
-    for (const auto& kv : bank_candidates) {
-      const BankCandidate& cand = kv.second;
-      if (!found) {
-        best = cand;
-        found = true;
-        continue;
-      }
-      if (candidate_rhs_better(best, cand, prioritize_traffic_class, true)) {
-        best = cand;
-      }
-    }
-
-    if (!found) return false;
-    req_it = best.it;
-    req_buffer = best.buffer;
-    return true;
+    return m_active_vertical_transfer_releases.size() >=
+           static_cast<size_t>(m_vertical_transfer_ports);
   }
 
   bool is_command_ready_for_issue(int command, const AddrVec_t& addr_vec) {
@@ -1505,7 +1347,7 @@ class BankParallelDRAMController final : public IDRAMController,
 
       if (m_shadow_scoreboard_log_mismatch || m_shadow_scoreboard_fail_fast) {
         std::ostringstream oss;
-        oss << "BankParallel channel " << m_channel_id
+        oss << "TieredM3D channel " << m_channel_id
             << ": ready mismatch cmd=" << command
             << " scoreboard=" << (scoreboard_ready ? 1 : 0)
             << " oracle=" << (oracle_ready ? 1 : 0)
@@ -1528,26 +1370,170 @@ class BankParallelDRAMController final : public IDRAMController,
     return scoreboard_ready;
   }
 
+  ReqBuffer::iterator get_best_request_filtered(
+      ReqBuffer& buffer,
+      const std::unordered_set<std::string>& used_access_banks,
+      bool allow_access, bool prioritize_traffic_class,
+      uint32_t background_cmds_issued_this_cycle,
+      uint32_t shadow_cmds_issued_this_cycle,
+      const std::vector<uint32_t>& tier_access_cmds_issued_this_cycle,
+      uint32_t tier_access_budget) {
+    if (buffer.size() == 0) {
+      return buffer.end();
+    }
+
+    for (auto& req : buffer) {
+      const int scoreboard_cmd =
+          get_prereq_command(req.final_command, req.addr_vec);
+      req.command = scoreboard_cmd;
+
+      if (m_shadow_scoreboard_enable && m_shadow_scoreboard.valid()) {
+        s_shadow_scoreboard_prereq_checks++;
+        const int oracle_cmd =
+            m_dram->get_preq_command(req.final_command, req.addr_vec);
+        if (oracle_cmd != scoreboard_cmd) {
+          s_shadow_scoreboard_prereq_mismatches++;
+          if (m_shadow_scoreboard_log_mismatch ||
+              m_shadow_scoreboard_fail_fast) {
+            std::ostringstream oss;
+            oss << "TieredM3D channel " << m_channel_id
+                << ": prereq mismatch final=" << req.final_command
+                << " scoreboard=" << scoreboard_cmd << " oracle=" << oracle_cmd
+                << " bank=" << bank_key(req.addr_vec);
+            const std::string msg = oss.str();
+            if (m_shadow_scoreboard_log_mismatch) {
+              spdlog::warn("{}", msg);
+            }
+            if (m_shadow_scoreboard_fail_fast) {
+              throw std::runtime_error(msg);
+            }
+          }
+        }
+      }
+    }
+
+    auto candidate = buffer.end();
+    for (auto it = buffer.begin(); it != buffer.end(); ++it) {
+      if (m_dram->m_command_meta(it->command).is_accessing && !allow_access) {
+        continue;
+      }
+      if (violates_access_bank_parallelism(*it, used_access_banks)) {
+        continue;
+      }
+      if (violates_tier_access_parallelism(
+              *it, tier_access_cmds_issued_this_cycle, tier_access_budget)) {
+        continue;
+      }
+      if (violates_vertical_transfer_budget(*it)) {
+        continue;
+      }
+      if (is_qos_budget_blocked(*it, background_cmds_issued_this_cycle,
+                                shadow_cmds_issued_this_cycle)) {
+        note_qos_budget_blocked(*it);
+        continue;
+      }
+      if (candidate == buffer.end()) {
+        candidate = it;
+        continue;
+      }
+      if (prioritize_traffic_class && prefer_request_qos(*it, *candidate) &&
+          !prefer_request_qos(*candidate, *it)) {
+        if (get_external_traffic_class(*it) == ExternalTrafficClass::kForeground &&
+            get_external_traffic_class(*candidate) !=
+                ExternalTrafficClass::kForeground) {
+          s_foreground_qos_wins++;
+        }
+        candidate = it;
+        continue;
+      }
+      candidate = m_scheduler->compare(candidate, it);
+    }
+    return candidate;
+  }
+
+  bool select_best_ready_from_buffer(
+      ReqBuffer& buffer,
+      const std::unordered_set<std::string>& used_access_banks,
+      bool allow_access, bool prioritize_traffic_class,
+      uint32_t background_cmds_issued_this_cycle,
+      uint32_t shadow_cmds_issued_this_cycle,
+      const std::vector<uint32_t>& tier_access_cmds_issued_this_cycle,
+      uint32_t tier_access_budget, ReqBuffer::iterator& req_it) {
+    req_it = get_best_request_filtered(buffer, used_access_banks, allow_access,
+                                       prioritize_traffic_class,
+                                       background_cmds_issued_this_cycle,
+                                       shadow_cmds_issued_this_cycle,
+                                       tier_access_cmds_issued_this_cycle,
+                                       tier_access_budget);
+    if (req_it == buffer.end()) {
+      return false;
+    }
+    return is_command_ready_for_issue(req_it->command, req_it->addr_vec);
+  }
+
   bool schedule_request_filtered(
       ReqBuffer::iterator& req_it, ReqBuffer*& req_buffer,
       const std::unordered_set<std::string>& used_access_banks,
       bool allow_access, uint32_t background_cmds_issued_this_cycle,
-      uint32_t shadow_cmds_issued_this_cycle) {
+      uint32_t shadow_cmds_issued_this_cycle,
+      const std::vector<uint32_t>& tier_access_cmds_issued_this_cycle,
+      uint32_t tier_access_budget) {
     bool request_found = false;
 
-    if (select_best_ready_from_buffers(
-            {&m_active_buffer}, used_access_banks, allow_access, m_qos_enable,
+    if (select_best_ready_from_buffer(
+            m_active_buffer, used_access_banks, allow_access, m_qos_enable,
             background_cmds_issued_this_cycle, shadow_cmds_issued_this_cycle,
-            req_it, req_buffer)) {
+            tier_access_cmds_issued_this_cycle, tier_access_budget, req_it)) {
       request_found = true;
+      req_buffer = &m_active_buffer;
     }
 
     if (!request_found) {
       if (m_priority_buffer.size() != 0) {
-        request_found = select_best_ready_from_buffers(
-            {&m_priority_buffer}, used_access_banks, allow_access, false,
-            background_cmds_issued_this_cycle, shadow_cmds_issued_this_cycle,
-            req_it, req_buffer);
+        req_buffer = &m_priority_buffer;
+        req_it = m_priority_buffer.begin();
+        const int scoreboard_cmd =
+            get_prereq_command(req_it->final_command, req_it->addr_vec);
+        req_it->command = scoreboard_cmd;
+        if (m_shadow_scoreboard_enable && m_shadow_scoreboard.valid()) {
+          s_shadow_scoreboard_prereq_checks++;
+          const int oracle_cmd =
+              m_dram->get_preq_command(req_it->final_command, req_it->addr_vec);
+          if (oracle_cmd != scoreboard_cmd) {
+            s_shadow_scoreboard_prereq_mismatches++;
+            if (m_shadow_scoreboard_log_mismatch ||
+                m_shadow_scoreboard_fail_fast) {
+              std::ostringstream oss;
+              oss << "TieredM3D channel " << m_channel_id
+                  << ": prereq mismatch final=" << req_it->final_command
+                  << " scoreboard=" << scoreboard_cmd
+                  << " oracle=" << oracle_cmd
+                  << " bank=" << bank_key(req_it->addr_vec);
+              const std::string msg = oss.str();
+              if (m_shadow_scoreboard_log_mismatch) {
+                spdlog::warn("{}", msg);
+              }
+              if (m_shadow_scoreboard_fail_fast) {
+                throw std::runtime_error(msg);
+              }
+            }
+          }
+        }
+
+        if (m_dram->m_command_meta(req_it->command).is_accessing && !allow_access) {
+          request_found = false;
+        } else if (violates_access_bank_parallelism(*req_it, used_access_banks)) {
+          request_found = false;
+        } else if (violates_tier_access_parallelism(
+                       *req_it, tier_access_cmds_issued_this_cycle,
+                       tier_access_budget)) {
+          request_found = false;
+        } else if (violates_vertical_transfer_budget(*req_it)) {
+          request_found = false;
+        } else {
+          request_found =
+              is_command_ready_for_issue(req_it->command, req_it->addr_vec);
+        }
         if (!request_found && m_priority_buffer.size() != 0) {
           return false;
         }
@@ -1559,36 +1545,29 @@ class BankParallelDRAMController final : public IDRAMController,
             m_is_write_mode ? &m_write_buffer : &m_read_buffer;
         ReqBuffer* secondary_buffer =
             m_is_write_mode ? &m_read_buffer : &m_write_buffer;
-        ReqBuffer::iterator primary_it;
-        ReqBuffer::iterator secondary_it;
-        ReqBuffer* primary_selected_buffer = nullptr;
-        ReqBuffer* secondary_selected_buffer = nullptr;
-        const bool primary_ready = select_best_ready_from_buffers(
-            {primary_buffer}, used_access_banks, allow_access, true,
+        ReqBuffer::iterator primary_it = primary_buffer->end();
+        ReqBuffer::iterator secondary_it = secondary_buffer->end();
+        const bool primary_ready = select_best_ready_from_buffer(
+            *primary_buffer, used_access_banks, allow_access, true,
             background_cmds_issued_this_cycle, shadow_cmds_issued_this_cycle,
-            primary_it, primary_selected_buffer);
+            tier_access_cmds_issued_this_cycle, tier_access_budget, primary_it);
         bool secondary_ready = false;
         if (!primary_ready ||
             (m_is_write_mode &&
              m_allow_foreground_read_interrupt_write_mode)) {
-          secondary_ready = select_best_ready_from_buffers(
-              {secondary_buffer}, used_access_banks, allow_access, true,
+          secondary_ready = select_best_ready_from_buffer(
+              *secondary_buffer, used_access_banks, allow_access, true,
               background_cmds_issued_this_cycle, shadow_cmds_issued_this_cycle,
-              secondary_it, secondary_selected_buffer);
+              tier_access_cmds_issued_this_cycle, tier_access_budget,
+              secondary_it);
         }
 
         if (m_is_write_mode && m_allow_foreground_read_interrupt_write_mode &&
             secondary_ready) {
-          bool secondary_should_win = !primary_ready;
-          if (!secondary_should_win) {
-            const BankCandidate primary_cand {primary_selected_buffer, primary_it,
-                                              bank_key(primary_it->addr_vec)};
-            const BankCandidate secondary_cand {
-                secondary_selected_buffer, secondary_it,
-                bank_key(secondary_it->addr_vec)};
-            secondary_should_win = candidate_rhs_better(
-                primary_cand, secondary_cand, true, false);
-          }
+          const bool secondary_should_win =
+              (!primary_ready) ||
+              (prefer_request_qos(*secondary_it, *primary_it) &&
+               !prefer_request_qos(*primary_it, *secondary_it));
           if (secondary_should_win) {
             if (get_external_traffic_class(*secondary_it) ==
                     ExternalTrafficClass::kForeground &&
@@ -1605,18 +1584,129 @@ class BankParallelDRAMController final : public IDRAMController,
 
         if (!request_found && primary_ready) {
           req_it = primary_it;
-          req_buffer = primary_selected_buffer;
+          req_buffer = primary_buffer;
           request_found = true;
         }
         if (!request_found && secondary_ready) {
           req_it = secondary_it;
-          req_buffer = secondary_selected_buffer;
+          req_buffer = secondary_buffer;
           request_found = true;
         }
       }
     }
 
+    if (request_found) {
+      if (m_dram->m_command_meta(req_it->command).is_closing) {
+        auto& rowgroup = req_it->addr_vec;
+        for (auto _it = m_active_buffer.begin(); _it != m_active_buffer.end();
+             _it++) {
+          auto& _it_rowgroup = _it->addr_vec;
+          bool is_matching = true;
+          for (int i = 0; i < m_bank_addr_idx + 1; i++) {
+            if (_it_rowgroup[i] != rowgroup[i] && _it_rowgroup[i] != -1 &&
+                rowgroup[i] != -1) {
+              is_matching = false;
+              break;
+            }
+          }
+          if (is_matching) {
+            request_found = false;
+            break;
+          }
+        }
+      }
+    }
+
     return request_found;
+  }
+
+  void retire_completed_vertical_transfers() {
+    while (!m_active_vertical_transfer_releases.empty()) {
+      auto it = m_active_vertical_transfer_releases.begin();
+      if (*it > m_clk) {
+        break;
+      }
+      m_active_vertical_transfer_releases.erase(it);
+    }
+  }
+
+  uint32_t request_transfer_units(const Request& req) const {
+    const uint32_t effective_size =
+        req.request_size_bytes > 0 ? req.request_size_bytes : m_transfer_unit_bytes;
+    const uint32_t unit_bytes = std::max<uint32_t>(1, m_transfer_unit_bytes);
+    return std::max<uint32_t>(
+        1, (effective_size + unit_bytes - 1) / unit_bytes);
+  }
+
+  Clk_t local_data_completion_extra_cycles(const Request& req) const {
+    if (!m_size_aware_timing) {
+      return 0;
+    }
+    const uint32_t transfer_units = request_transfer_units(req);
+    if (transfer_units <= 1) {
+      return 0;
+    }
+    return static_cast<Clk_t>(transfer_units - 1) *
+           static_cast<Clk_t>(m_local_burst_transfer_cycles);
+  }
+
+  Clk_t vertical_transfer_extra_cycles(const Request& req) const {
+    if (!requires_vertical_transfer(req)) {
+      return 0;
+    }
+    if (!m_size_aware_timing) {
+      return 0;
+    }
+    const uint32_t cycles_per_burst =
+        is_vertical_copy_path(req) ? m_vertical_copy_cycles_per_burst
+                                   : m_vertical_transfer_cycles_per_burst;
+    return static_cast<Clk_t>(request_transfer_units(req)) *
+           static_cast<Clk_t>(cycles_per_burst);
+  }
+
+  Clk_t vertical_transfer_occupancy_cycles(const Request& req) const {
+    if (!requires_vertical_transfer(req)) {
+      return 0;
+    }
+    if (!m_size_aware_timing) {
+      return 1;
+    }
+    Clk_t cycles = vertical_transfer_extra_cycles(req);
+    if (cycles < 1) {
+      cycles = 1;
+    }
+    return cycles;
+  }
+
+  void reserve_vertical_transfer(const Request& req) {
+    if (!requires_vertical_transfer(req) || m_vertical_transfer_ports == 0) {
+      return;
+    }
+    const Clk_t occupancy_cycles = vertical_transfer_occupancy_cycles(req);
+    m_active_vertical_transfer_releases.insert(m_clk + occupancy_cycles);
+  }
+
+  Clk_t completion_depart_cycle(const Request& req) const {
+    if (req.type_id == Request::Type::Read) {
+      Clk_t base = m_dram->m_read_latency;
+      if (base < 1) {
+        base = 1;
+      }
+      return m_clk + base + local_data_completion_extra_cycles(req) +
+             vertical_transfer_extra_cycles(req);
+    }
+    if (req.type_id == Request::Type::Write) {
+      if (m_write_completion_mode == WriteCompletionMode::kPosted) {
+        return m_clk + 1;
+      }
+      Clk_t base = m_dram->m_write_latency;
+      if (base < 1) {
+        base = 1;
+      }
+      return m_clk + base + local_data_completion_extra_cycles(req) +
+             vertical_transfer_extra_cycles(req);
+    }
+    return m_clk + 1;
   }
 
   void finalize() override {
@@ -1636,6 +1726,14 @@ class BankParallelDRAMController final : public IDRAMController,
       s_avg_cmds_issued_per_cycle = (float)s_cmds_issued_total / (float)m_clk;
       s_avg_access_cmds_issued_per_cycle =
           (float)s_access_cmds_issued_total / (float)m_clk;
+      s_avg_shared_access_cmds_issued_per_cycle =
+          (float)s_shared_access_cmds_issued_total / (float)m_clk;
+      s_avg_vertical_transfer_cmds_issued_per_cycle =
+          (float)s_vertical_transfer_cmds_issued_total / (float)m_clk;
+      for (size_t tier = 0; tier < m_num_tiers; tier++) {
+        s_avg_tier_access_cmds_issued_per_cycle[tier] =
+            (float)s_tier_access_cmds_issued_total[tier] / (float)m_clk;
+      }
     }
 
     for (const auto traffic_class : kTrafficClasses) {
