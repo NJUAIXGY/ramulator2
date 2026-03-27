@@ -78,17 +78,22 @@ class BLISSScheduler : public IBHScheduler, public Implementation {
       }
 
       for (auto& req : buffer) {
-        req.command = m_ctrl->get_prereq_command(req.final_command, req.addr_vec);
+        ControllerCommandState command_state {};
+        if (m_ctrl->query_command_state(req.final_command, req.addr_vec,
+                                        command_state)) {
+          req.command = command_state.next_command;
+          req.scratchpad[READY_IDX] =
+              command_state.next_command_ready ? 1 : 0;
+        } else {
+          req.command = -1;
+          req.scratchpad[READY_IDX] = 0;
+        }
 
         // Check if the request is safe to issue
         bool blisted = m_bliss->is_blacklisted(req.source_id);
         bool isrw = req.type_id == m_req_rd || req.type_id == m_req_wr;
         bool safe = !isrw || !blisted;
         req.scratchpad[SAFE_IDX] = safe;
-        
-        // Check if the request is ready
-        bool ready = m_ctrl->is_command_ready(req.command, req.addr_vec);
-        req.scratchpad[READY_IDX] = ready;
       }
 
       auto candidate = buffer.begin();

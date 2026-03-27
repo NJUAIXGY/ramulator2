@@ -15,7 +15,8 @@ void BankMachine::configure_scoreboard_autoprecharge(uint32_t cap, int cmd_rd,
 }
 
 BankMachine::IssuePlan BankMachine::build_issue_plan(
-    const Request& req, const ProbeResult& probe, Clk_t clk) const {
+    const Request& req, const SchedulingState& scheduling_state,
+    Clk_t clk) const {
   IssuePlan plan {};
   if (!m_dram) {
     return plan;
@@ -24,12 +25,11 @@ BankMachine::IssuePlan BankMachine::build_issue_plan(
   plan.issue_command = req.command;
   plan.completes_request = (req.command == req.final_command);
 
-  if (should_force_autoprecharge(req, probe, clk)) {
-    if (req.type_id == Request::Type::Read) {
-      plan.issue_command = m_cmd_rda;
-    } else if (req.type_id == Request::Type::Write) {
-      plan.issue_command = m_cmd_wra;
-    }
+  const int forced_autoprecharge_command =
+      resolve_forced_autoprecharge_command(req, scheduling_state.bank_state,
+                                           clk);
+  if (forced_autoprecharge_command >= 0) {
+    plan.issue_command = forced_autoprecharge_command;
     plan.completes_request = true;
     plan.forced_autoprecharge = true;
   }
@@ -38,16 +38,23 @@ BankMachine::IssuePlan BankMachine::build_issue_plan(
   return plan;
 }
 
-bool BankMachine::should_force_autoprecharge(const Request& req,
-                                             const ProbeResult& probe,
-                                             Clk_t clk) const {
-  if (!m_dram) return false;
-  if (m_scoreboard_autoprecharge_cap == 0) return false;
-  if (req.command != req.final_command) return false;
-  if (!probe.valid || !probe.row_hit || probe.refreshing) return false;
+int BankMachine::resolve_forced_autoprecharge_command(
+    const Request& req, const BankStateSnapshot& bank_state,
+    Clk_t clk) const {
+  if (!m_dram) return -1;
+  if (m_scoreboard_autoprecharge_cap == 0) return -1;
+  if (m_scoreboard && m_scoreboard->valid()) {
+    const ForcedAutoprechargeDecision decision =
+        m_scoreboard->evaluate_forced_autoprecharge(
+            m_dram, req, bank_state, clk, m_scoreboard_autoprecharge_cap);
+    return decision.force ? decision.issue_command : -1;
+  }
 
+  if (req.command != req.final_command) return -1;
+  if (!bank_state.valid || !bank_state.row_hit) return -1;
+  if (bank_state.refreshing || bank_state.refresh_recovery) return -1;
   const auto cmd_meta = m_dram->m_command_meta(req.command);
-  if (!cmd_meta.is_accessing || cmd_meta.is_closing) return false;
+  if (!cmd_meta.is_accessing || cmd_meta.is_closing) return -1;
 
   int target_command = -1;
   if (req.type_id == Request::Type::Read && req.command == m_cmd_rd) {
@@ -55,23 +62,18 @@ bool BankMachine::should_force_autoprecharge(const Request& req,
   } else if (req.type_id == Request::Type::Write && req.command == m_cmd_wr) {
     target_command = m_cmd_wra;
   } else {
-    return false;
+    return -1;
   }
 
-  if (probe.col_accesses_on_row + 1 <
+  if (bank_state.col_accesses_on_row + 1 <
       static_cast<uint64_t>(m_scoreboard_autoprecharge_cap)) {
-    return false;
+    return -1;
   }
-  if (m_scoreboard && m_scoreboard->valid()) {
-    if (!m_scoreboard->is_command_ready(m_dram, target_command, req.addr_vec,
-                                        clk)) {
-      return false;
-    }
-  } else if (!m_dram->check_ready(target_command, req.addr_vec)) {
-    return false;
+  if (!m_dram->check_ready(target_command, req.addr_vec)) {
+    return -1;
   }
 
-  return true;
+  return target_command;
 }
 
 BankMachine::TransitionType BankMachine::classify_transition(

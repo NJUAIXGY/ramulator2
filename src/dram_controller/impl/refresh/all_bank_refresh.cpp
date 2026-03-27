@@ -56,6 +56,21 @@ class AllBankRefresh : public IRefreshManager, public Implementation {
       }
     };
 
+    RefreshScheduleHint query_refresh_schedule_hint() const override {
+      RefreshScheduleHint hint {};
+      if (m_nrefi <= 0 || m_next_refresh_cycle < 0) {
+        return hint;
+      }
+
+      hint.valid = true;
+      hint.refresh_interval_cycles = static_cast<uint64_t>(m_nrefi);
+      const Clk_t remaining_cycles =
+          (m_next_refresh_cycle > m_clk) ? (m_next_refresh_cycle - m_clk) : 0;
+      hint.next_refresh_deadline_cycles =
+          static_cast<uint64_t>(remaining_cycles);
+      return hint;
+    }
+
 };
 
 }       // namespace Ramulator

@@ -10,6 +10,14 @@
 
 namespace Ramulator {
 
+enum class RefreshScopeKind {
+  kNone = 0,
+  kBank,
+  kBankGroup,
+  kRank,
+  kChannel,
+};
+
 struct ProbeResult {
   bool valid = false;
   bool row_hit = false;
@@ -19,8 +27,87 @@ struct ProbeResult {
   bool autoprecharge_armed = false;
 };
 
+enum class ReadyBlockReason {
+  kNone = 0,
+  kScoreboardMiss,
+  kInvalidCommand,
+  kAddressDecodeMiss,
+  kRankRefreshActive,
+  kRankRefreshRecovery,
+  kRankPrechargeTiming,
+  kRankRefreshTiming,
+  kRefreshScopeOpenRows,
+  kBankRefreshActive,
+  kBankRefreshRecovery,
+  kBankOpen,
+  kBankClosed,
+  kRowConflict,
+  kActivateWindow,
+  kFourActivateWindow,
+  kBankTimingAct,
+  kBankTimingPre,
+  kColumnBusTiming,
+  kReadDataTiming,
+  kWriteDataTiming,
+  kReadTurnaroundTiming,
+  kWriteTurnaroundTiming,
+  kBankTimingRead,
+  kBankTimingWrite,
+};
+
+struct RefreshStateSnapshot {
+  bool valid = false;
+  bool pending = false;
+  bool active = false;
+  bool recovery = false;
+  RefreshScopeKind owner_scope = RefreshScopeKind::kNone;
+  uint64_t epoch = 0;
+  uint64_t horizon_cycles = 0;
+};
+
+struct BankStateSnapshot {
+  bool valid = false;
+  bool row_open = false;
+  bool row_hit = false;
+  bool refresh_pending = false;
+  bool refreshing = false;
+  bool refresh_recovery = false;
+  bool autoprecharge_armed = false;
+  bool open_row_valid = false;
+  int open_row = -1;
+  uint64_t inflight_accesses = 0;
+  uint64_t col_accesses_on_row = 0;
+  uint64_t open_age_cycles = 0;
+  uint64_t act_ready_in_cycles = 0;
+  uint64_t pre_ready_in_cycles = 0;
+  uint64_t read_ready_in_cycles = 0;
+  uint64_t write_ready_in_cycles = 0;
+  uint64_t refresh_epoch = 0;
+  RefreshScopeKind refresh_owner_scope = RefreshScopeKind::kNone;
+};
+
+struct SchedulingState {
+  bool valid = false;
+  BankStateSnapshot bank_state {};
+  ProbeResult row_state {};
+  int next_command = -1;
+  bool next_command_ready = false;
+  bool prereq_scoreboard_miss = false;
+  bool rowstate_scoreboard_miss = false;
+  ReadyBlockReason ready_block_reason = ReadyBlockReason::kNone;
+  RefreshStateSnapshot refresh_state {};
+};
+
+struct ForcedAutoprechargeDecision {
+  bool valid = false;
+  bool force = false;
+  int issue_command = -1;
+  ReadyBlockReason block_reason = ReadyBlockReason::kNone;
+};
+
 struct TelemetryResult {
   bool valid = false;
+  BankStateSnapshot bank_state {};
   bool row_hit = false;
   bool row_open = false;
   bool refreshing = false;
@@ -31,14 +118,8 @@ struct TelemetryResult {
   int open_row = -1;
   uint64_t refresh_epoch = 0;
   uint64_t refresh_horizon_cycles = 0;
-};
-
-enum class RefreshScopeKind {
-  kNone = 0,
-  kBank,
-  kBankGroup,
-  kRank,
-  kChannel,
+  ReadyBlockReason ready_block_reason = ReadyBlockReason::kNone;
+  RefreshStateSnapshot refresh_state {};
 };
 
 struct RefreshScopeState {
@@ -124,24 +205,47 @@ class BankStateScoreboard {
   void on_refresh_exit(RefreshScopeKind scope_kind,
                        const AddrVec_t& scope_addr_vec, Clk_t clk);
 
+  // Controller-owned scheduling snapshot for a request.
+  //
+  // This is the preferred hot-path API for controller arbitration:
+  // - `next_command` is the next DRAM command to issue for `final_command`
+  // - `next_command_ready` reports whether that command is issuable at `clk`
+  // - `bank_state` is the structured bank/row snapshot owned by scoreboard
+  // - `row_state` captures the bank/row state view used by bank-machine/stats
+  // - `*_scoreboard_miss` exposes remaining scoreboard coverage holes
+  SchedulingState resolve_scheduling_state(
+      IDRAM* dram, int final_command, const AddrVec_t& addr_vec,
+      Clk_t clk) const;
+  BankStateSnapshot snapshot_bank_state(const AddrVec_t& addr_vec,
+                                        Clk_t clk) const;
   ProbeResult probe(IDRAM* dram, int final_command,
                     const AddrVec_t& addr_vec) const;
   // Controller-owned prerequisite command resolution based on scoreboard state.
   //
   // Returns:
   //   - a DRAM command id to issue next (ACT/PRE/RD/WR/PREA/REF...)
-  //   - or -1 if the scoreboard cannot answer (caller may fallback to DRAM).
+  //   - or -1 if the scoreboard cannot answer (legacy callers may fallback to
+  //     DRAM oracle, but mainline controllers should treat that as a
+  //     compatibility path and keep scoreboard as the primary source).
   int get_prereq_command(IDRAM* dram, int final_command,
                          const AddrVec_t& addr_vec) const;
   TelemetryResult query_telemetry(IDRAM* dram, int final_command,
                                   const AddrVec_t& addr_vec, Clk_t clk) const;
+  RefreshStateSnapshot snapshot_global_refresh_state(Clk_t clk) const;
   bool is_command_ready(IDRAM* dram, int command, const AddrVec_t& addr_vec,
                         Clk_t clk) const;
+  ForcedAutoprechargeDecision evaluate_forced_autoprecharge(
+      IDRAM* dram, const Request& req, const BankStateSnapshot& bank_state,
+      Clk_t clk, uint32_t autoprecharge_cap) const;
   ShadowDiffResult diff_against_dram(IDRAM* dram, int final_command,
                                      const AddrVec_t& addr_vec) const;
 
   size_t count_refreshing_banks() const;
   size_t count_refresh_pending_banks() const;
+  size_t count_open_banks() const;
+  size_t count_inflight_banks() const;
+  size_t count_autoprecharge_armed_banks() const;
+  uint64_t max_open_row_age_cycles(Clk_t clk) const;
   const RefreshScopeState& refresh_scope_state() const {
     return m_refresh_scope_state;
   }
@@ -205,6 +309,16 @@ class BankStateScoreboard {
                               int& bank) const;
   size_t flatten_index(int rank, int bg, int bank) const;
   bool any_open_row_in_scope(const AddrVec_t& addr_vec) const;
+  RefreshStateSnapshot snapshot_refresh_state(const AddrVec_t& addr_vec,
+                                             Clk_t clk) const;
+
+  struct ReadyResult {
+    bool ready = false;
+    ReadyBlockReason block_reason = ReadyBlockReason::kInvalidCommand;
+  };
+  ReadyResult evaluate_command_ready(IDRAM* dram, int command,
+                                     const AddrVec_t& addr_vec,
+                                     Clk_t clk) const;
 
   template <typename Fn>
   void for_each_target_bank(const AddrVec_t& addr_vec, Fn&& fn) {

@@ -36,20 +36,22 @@ class BankMachine {
   void configure_scoreboard_autoprecharge(uint32_t cap, int cmd_rd, int cmd_wr,
                                           int cmd_rda, int cmd_wra);
 
-  IssuePlan build_issue_plan(const Request& req, const ProbeResult& probe,
+  IssuePlan build_issue_plan(const Request& req,
+                             const SchedulingState& scheduling_state,
                              Clk_t clk) const;
 
  private:
   IDRAM* m_dram = nullptr;
   const BankStateScoreboard* m_scoreboard = nullptr;
-  uint32_t m_scoreboard_autoprecharge_cap = 0;
+ uint32_t m_scoreboard_autoprecharge_cap = 0;
   int m_cmd_rd = -1;
   int m_cmd_wr = -1;
   int m_cmd_rda = -1;
   int m_cmd_wra = -1;
 
-  bool should_force_autoprecharge(const Request& req,
-                                  const ProbeResult& probe, Clk_t clk) const;
+  int resolve_forced_autoprecharge_command(
+      const Request& req, const BankStateSnapshot& bank_state,
+      Clk_t clk) const;
   TransitionType classify_transition(int issue_command) const;
 };
 

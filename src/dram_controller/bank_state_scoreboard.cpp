@@ -6,6 +6,25 @@
 
 namespace Ramulator {
 
+namespace {
+
+ProbeResult probe_result_from_bank_state(const BankStateSnapshot& bank_state) {
+  ProbeResult result {};
+  if (!bank_state.valid) {
+    return result;
+  }
+
+  result.valid = true;
+  result.row_open = bank_state.row_open;
+  result.row_hit = bank_state.row_hit;
+  result.refreshing = bank_state.refreshing || bank_state.refresh_recovery;
+  result.col_accesses_on_row = bank_state.col_accesses_on_row;
+  result.autoprecharge_armed = bank_state.autoprecharge_armed;
+  return result;
+}
+
+}  // namespace
+
 int BankStateScoreboard::try_level_index(IDRAM* dram, const char* level_name) {
   try {
     return dram->m_levels(level_name);
@@ -203,6 +222,302 @@ bool BankStateScoreboard::any_open_row_in_scope(const AddrVec_t& addr_vec) const
   }
 
   return false;
+}
+
+RefreshStateSnapshot BankStateScoreboard::snapshot_refresh_state(
+    const AddrVec_t& addr_vec, Clk_t clk) const {
+  RefreshStateSnapshot result {};
+  if (!m_valid) {
+    return result;
+  }
+
+  int rank = 0;
+  int bg = 0;
+  int bank = 0;
+  if (lookup_bank_components(addr_vec, rank, bg, bank)) {
+    const BankStateEntry& entry = m_bank_entries[flatten_index(rank, bg, bank)];
+    result.valid = true;
+    result.pending = entry.refresh_pending;
+    result.active = entry.refreshing;
+    result.recovery = entry.refresh_recovery;
+    result.owner_scope = entry.refresh_owner_scope;
+    result.epoch = entry.refresh_epoch;
+    const Clk_t blocked_until =
+        std::max(entry.refresh_blocked_until, entry.recovery_blocked_until);
+    if (blocked_until > clk) {
+      result.horizon_cycles = static_cast<uint64_t>(blocked_until - clk);
+    }
+    return result;
+  }
+
+  const bool scope_known = m_refresh_scope_state.kind != RefreshScopeKind::kNone ||
+                           m_refresh_scope_state.pending ||
+                           m_refresh_scope_state.active ||
+                           m_refresh_scope_state.epoch != 0;
+  if (!scope_known) {
+    return result;
+  }
+
+  result.valid = true;
+  result.pending = m_refresh_scope_state.pending;
+  result.active = m_refresh_scope_state.active;
+  result.recovery = false;
+  result.owner_scope = m_refresh_scope_state.kind;
+  result.epoch = m_refresh_scope_state.epoch;
+  if (m_refresh_scope_state.active && m_refresh_scope_state.enter_cycle >= 0 &&
+      m_timing_nrfc > 0) {
+    const Clk_t scope_blocked_until =
+        safe_add(m_refresh_scope_state.enter_cycle, m_timing_nrfc);
+    if (scope_blocked_until > clk) {
+      result.horizon_cycles = static_cast<uint64_t>(scope_blocked_until - clk);
+    }
+  }
+  return result;
+}
+
+BankStateSnapshot BankStateScoreboard::snapshot_bank_state(
+    const AddrVec_t& addr_vec, Clk_t clk) const {
+  BankStateSnapshot result {};
+  if (!m_valid) {
+    return result;
+  }
+
+  int rank = 0;
+  int bg = 0;
+  int bank = 0;
+  if (!lookup_bank_components(addr_vec, rank, bg, bank)) {
+    return result;
+  }
+
+  const BankStateEntry& entry = m_bank_entries[flatten_index(rank, bg, bank)];
+  const int row = addr_component(addr_vec, m_level_row);
+
+  result.valid = true;
+  result.open_row_valid = entry.open_row_valid;
+  result.open_row = entry.open_row_valid ? entry.open_row : -1;
+  result.row_open = entry.open_row_valid && !entry.refreshing;
+  result.row_hit =
+      result.row_open && row >= 0 && entry.open_row_valid && entry.open_row == row;
+  result.refresh_pending = entry.refresh_pending;
+  result.refreshing = entry.refreshing;
+  result.refresh_recovery = entry.refresh_recovery;
+  result.autoprecharge_armed = entry.autoprecharge_armed;
+  result.inflight_accesses = entry.inflight_accesses;
+  result.col_accesses_on_row = entry.col_accesses_on_row;
+  if (entry.open_row_valid && entry.open_since_cycle >= 0 &&
+      clk >= entry.open_since_cycle) {
+    result.open_age_cycles = static_cast<uint64_t>(clk - entry.open_since_cycle);
+  }
+  result.act_ready_in_cycles = entry.next_act_ready_at > clk
+                                   ? static_cast<uint64_t>(entry.next_act_ready_at - clk)
+                                   : 0;
+  result.pre_ready_in_cycles = entry.next_pre_ready_at > clk
+                                   ? static_cast<uint64_t>(entry.next_pre_ready_at - clk)
+                                   : 0;
+  result.read_ready_in_cycles =
+      entry.next_read_ready_at > clk
+          ? static_cast<uint64_t>(entry.next_read_ready_at - clk)
+          : 0;
+  result.write_ready_in_cycles =
+      entry.next_write_ready_at > clk
+          ? static_cast<uint64_t>(entry.next_write_ready_at - clk)
+          : 0;
+  result.refresh_epoch = entry.refresh_epoch;
+  result.refresh_owner_scope = entry.refresh_owner_scope;
+  return result;
+}
+
+BankStateScoreboard::ReadyResult BankStateScoreboard::evaluate_command_ready(
+    IDRAM* dram, int command, const AddrVec_t& addr_vec, Clk_t clk) const {
+  ReadyResult result {};
+  result.block_reason = ReadyBlockReason::kNone;
+  if (!m_valid || !dram) {
+    result.block_reason = ReadyBlockReason::kScoreboardMiss;
+    return result;
+  }
+  if (command < 0) {
+    result.block_reason = ReadyBlockReason::kInvalidCommand;
+    return result;
+  }
+
+  if (command == m_cmd_prea || command == m_cmd_refab) {
+    bool has_target = false;
+    for_each_target_rank_const(addr_vec,
+                               [&](const RankTimingEntry& rank_entry, int) {
+                                 if (has_target &&
+                                     result.block_reason !=
+                                         ReadyBlockReason::kNone) {
+                                   return;
+                                 }
+                                 has_target = true;
+                                 if (clk < rank_entry.refresh_active_until) {
+                                   result.block_reason =
+                                       ReadyBlockReason::kRankRefreshActive;
+                                   return;
+                                 }
+                                 if (clk < rank_entry.refresh_recovery_until) {
+                                   result.block_reason =
+                                       ReadyBlockReason::kRankRefreshRecovery;
+                                   return;
+                                 }
+                                 if (command == m_cmd_prea &&
+                                     clk < rank_entry.next_prea_ready_at) {
+                                   result.block_reason =
+                                       ReadyBlockReason::kRankPrechargeTiming;
+                                   return;
+                                 }
+                                 if (command == m_cmd_refab &&
+                                     clk < rank_entry.next_ref_ready_at) {
+                                   result.block_reason =
+                                       ReadyBlockReason::kRankRefreshTiming;
+                                 }
+                               });
+    if (!has_target) {
+      result.block_reason = ReadyBlockReason::kAddressDecodeMiss;
+      return result;
+    }
+    if (result.block_reason != ReadyBlockReason::kNone) {
+      return result;
+    }
+    if (command == m_cmd_refab && any_open_row_in_scope(addr_vec)) {
+      result.block_reason = ReadyBlockReason::kRefreshScopeOpenRows;
+      return result;
+    }
+    result.ready = true;
+    return result;
+  }
+
+  const bool is_bank_local_tracked =
+      command == m_cmd_act || command == m_cmd_pre ||
+      is_read_like_command(command) || is_write_like_command(command);
+  if (!is_bank_local_tracked) {
+    result.ready = true;
+    result.block_reason = ReadyBlockReason::kNone;
+    return result;
+  }
+
+  int rank = 0;
+  int bg = 0;
+  int bank = 0;
+  if (!lookup_bank_components(addr_vec, rank, bg, bank)) {
+    result.block_reason = ReadyBlockReason::kAddressDecodeMiss;
+    return result;
+  }
+
+  const BankStateEntry& entry = m_bank_entries[flatten_index(rank, bg, bank)];
+  const auto meta = dram->m_command_meta(command);
+
+  if (!meta.is_refreshing) {
+    if (clk < entry.refresh_blocked_until) {
+      result.block_reason = ReadyBlockReason::kBankRefreshActive;
+      return result;
+    }
+    if (clk < entry.recovery_blocked_until) {
+      result.block_reason = ReadyBlockReason::kBankRefreshRecovery;
+      return result;
+    }
+  }
+
+  const int row = addr_component(addr_vec, m_level_row);
+  if (command == m_cmd_act && entry.open_row_valid) {
+    result.block_reason = ReadyBlockReason::kBankOpen;
+    return result;
+  }
+  if (is_read_like_command(command) || is_write_like_command(command)) {
+    if (!entry.open_row_valid) {
+      result.block_reason = ReadyBlockReason::kBankClosed;
+      return result;
+    }
+    if (row < 0 || entry.open_row != row) {
+      result.block_reason = ReadyBlockReason::kRowConflict;
+      return result;
+    }
+  }
+  if (command == m_cmd_pre && !entry.open_row_valid) {
+    result.block_reason = ReadyBlockReason::kBankClosed;
+    return result;
+  }
+
+  if (command == m_cmd_act) {
+    if (clk < m_layer_timing.next_act_ready_at) {
+      result.block_reason = ReadyBlockReason::kActivateWindow;
+      return result;
+    }
+    if (m_timing_nfaw > 0) {
+      size_t window_acts = 0;
+      for (const Clk_t act_clk : m_layer_timing.recent_act_cycles) {
+        if (safe_add(act_clk, m_timing_nfaw) > clk) {
+          window_acts++;
+        }
+      }
+      if (window_acts >= 4) {
+        result.block_reason = ReadyBlockReason::kFourActivateWindow;
+        return result;
+      }
+    }
+    if (clk < entry.next_act_ready_at) {
+      result.block_reason = ReadyBlockReason::kBankTimingAct;
+      return result;
+    }
+    result.ready = true;
+    result.block_reason = ReadyBlockReason::kNone;
+    return result;
+  }
+  if (command == m_cmd_pre) {
+    if (clk < entry.next_pre_ready_at) {
+      result.block_reason = ReadyBlockReason::kBankTimingPre;
+      return result;
+    }
+    result.ready = true;
+    result.block_reason = ReadyBlockReason::kNone;
+    return result;
+  }
+  if (is_read_like_command(command)) {
+    if (clk < m_layer_timing.next_col_issue_ready_at) {
+      result.block_reason = ReadyBlockReason::kColumnBusTiming;
+      return result;
+    }
+    if (clk < m_layer_timing.next_read_data_ready_at) {
+      result.block_reason = ReadyBlockReason::kReadDataTiming;
+      return result;
+    }
+    if (clk < m_layer_timing.next_read_ready_at) {
+      result.block_reason = ReadyBlockReason::kReadTurnaroundTiming;
+      return result;
+    }
+    if (clk < entry.next_read_ready_at) {
+      result.block_reason = ReadyBlockReason::kBankTimingRead;
+      return result;
+    }
+    result.ready = true;
+    result.block_reason = ReadyBlockReason::kNone;
+    return result;
+  }
+  if (is_write_like_command(command)) {
+    if (clk < m_layer_timing.next_col_issue_ready_at) {
+      result.block_reason = ReadyBlockReason::kColumnBusTiming;
+      return result;
+    }
+    if (clk < m_layer_timing.next_write_data_ready_at) {
+      result.block_reason = ReadyBlockReason::kWriteDataTiming;
+      return result;
+    }
+    if (clk < m_layer_timing.next_write_ready_at) {
+      result.block_reason = ReadyBlockReason::kWriteTurnaroundTiming;
+      return result;
+    }
+    if (clk < entry.next_write_ready_at) {
+      result.block_reason = ReadyBlockReason::kBankTimingWrite;
+      return result;
+    }
+    result.ready = true;
+    result.block_reason = ReadyBlockReason::kNone;
+    return result;
+  }
+
+  result.ready = true;
+  result.block_reason = ReadyBlockReason::kNone;
+  return result;
 }
 
 void BankStateScoreboard::init_from_dram_org(IDRAM* dram, int channel_id) {
@@ -529,32 +844,51 @@ void BankStateScoreboard::on_request_completed(const Request& req, Clk_t clk) {
   }
 }
 
+SchedulingState BankStateScoreboard::resolve_scheduling_state(
+    IDRAM* dram, int final_command, const AddrVec_t& addr_vec,
+    Clk_t clk) const {
+  SchedulingState result {};
+  if (!m_valid || !dram || final_command < 0) {
+    result.ready_block_reason = ReadyBlockReason::kScoreboardMiss;
+    return result;
+  }
+
+  result.refresh_state = snapshot_refresh_state(addr_vec, clk);
+  result.bank_state = snapshot_bank_state(addr_vec, clk);
+  result.next_command = get_prereq_command(dram, final_command, addr_vec);
+  result.prereq_scoreboard_miss = (result.next_command < 0);
+  if (result.next_command >= 0) {
+    const ReadyResult ready =
+        evaluate_command_ready(dram, result.next_command, addr_vec, clk);
+    result.next_command_ready = ready.ready;
+    result.ready_block_reason = ready.block_reason;
+  } else {
+    result.ready_block_reason = ReadyBlockReason::kScoreboardMiss;
+  }
+
+  const auto meta = dram->m_command_meta(final_command);
+  if (meta.is_refreshing) {
+    result.row_state.valid = false;
+    result.row_state.refreshing =
+        result.refresh_state.pending || result.refresh_state.active ||
+        result.refresh_state.recovery || result.bank_state.refreshing ||
+        result.bank_state.refresh_recovery;
+  } else {
+    result.row_state = probe_result_from_bank_state(result.bank_state);
+    result.rowstate_scoreboard_miss = !result.bank_state.valid;
+  }
+
+  result.valid = (result.next_command >= 0) || result.bank_state.valid ||
+                 result.row_state.valid || result.row_state.refreshing ||
+                 result.refresh_state.valid;
+  return result;
+}
+
 ProbeResult BankStateScoreboard::probe(IDRAM* dram, int final_command,
                                        const AddrVec_t& addr_vec) const {
   (void)dram;
   (void)final_command;
-  ProbeResult result {};
-  if (!m_valid) return result;
-
-  int rank = 0;
-  int bg = 0;
-  int bank = 0;
-  if (!lookup_bank_components(addr_vec, rank, bg, bank)) {
-    return result;
-  }
-
-  const BankStateEntry& entry = m_bank_entries[flatten_index(rank, bg, bank)];
-  const int row = addr_component(addr_vec, m_level_row);
-  const bool row_open = entry.open_row_valid && !entry.refreshing;
-  const bool row_hit = row_open && row >= 0 && entry.open_row == row;
-
-  result.valid = true;
-  result.row_open = row_open;
-  result.row_hit = row_hit;
-  result.refreshing = entry.refreshing || entry.refresh_recovery;
-  result.col_accesses_on_row = entry.col_accesses_on_row;
-  result.autoprecharge_armed = entry.autoprecharge_armed;
-  return result;
+  return probe_result_from_bank_state(snapshot_bank_state(addr_vec, 0));
 }
 
 int BankStateScoreboard::get_prereq_command(IDRAM* dram, int final_command,
@@ -622,145 +956,156 @@ TelemetryResult BankStateScoreboard::query_telemetry(
     IDRAM* dram, int final_command, const AddrVec_t& addr_vec,
     Clk_t clk) const {
   TelemetryResult result {};
-  const ProbeResult probe_result = probe(dram, final_command, addr_vec);
-  if (!probe_result.valid) {
+  const BankStateSnapshot bank_state = snapshot_bank_state(addr_vec, clk);
+  if (!bank_state.valid) {
     return result;
   }
-
-  int rank = 0;
-  int bg = 0;
-  int bank = 0;
-  if (!lookup_bank_components(addr_vec, rank, bg, bank)) {
-    return result;
-  }
-
-  const BankStateEntry& entry = m_bank_entries[flatten_index(rank, bg, bank)];
-  const bool command_ready = is_command_ready(dram, final_command, addr_vec, clk);
-  const Clk_t refresh_blocked_until =
-      std::max(entry.refresh_blocked_until, entry.recovery_blocked_until);
+  const ProbeResult probe_result = probe_result_from_bank_state(bank_state);
+  const ReadyResult ready =
+      evaluate_command_ready(dram, final_command, addr_vec, clk);
+  const RefreshStateSnapshot refresh_state =
+      snapshot_refresh_state(addr_vec, clk);
 
   result.valid = true;
+  result.bank_state = bank_state;
   result.row_hit = probe_result.row_hit;
   result.row_open = probe_result.row_open;
   result.refreshing = probe_result.refreshing;
-  result.bank_busy = (entry.inflight_accesses > 0) || !command_ready;
-  result.inflight_accesses = entry.inflight_accesses;
-  result.col_accesses_on_row = probe_result.col_accesses_on_row;
-  result.autoprecharge_armed = probe_result.autoprecharge_armed;
-  result.open_row = entry.open_row_valid ? entry.open_row : -1;
-  result.refresh_epoch = entry.refresh_epoch;
-  if (refresh_blocked_until > clk) {
-    result.refresh_horizon_cycles =
-        static_cast<uint64_t>(refresh_blocked_until - clk);
+  result.bank_busy = (bank_state.inflight_accesses > 0) || !ready.ready;
+  result.inflight_accesses = bank_state.inflight_accesses;
+  result.col_accesses_on_row = bank_state.col_accesses_on_row;
+  result.autoprecharge_armed = bank_state.autoprecharge_armed;
+  result.open_row = bank_state.open_row_valid ? bank_state.open_row : -1;
+  result.refresh_epoch = refresh_state.epoch;
+  result.refresh_horizon_cycles = refresh_state.horizon_cycles;
+  result.ready_block_reason = ready.block_reason;
+  result.refresh_state = refresh_state;
+  return result;
+}
+
+RefreshStateSnapshot BankStateScoreboard::snapshot_global_refresh_state(
+    Clk_t clk) const {
+  RefreshStateSnapshot result {};
+  if (!m_valid) {
+    return result;
   }
+
+  const bool scope_known = m_refresh_scope_state.kind != RefreshScopeKind::kNone ||
+                           m_refresh_scope_state.pending ||
+                           m_refresh_scope_state.active ||
+                           m_refresh_scope_state.epoch != 0;
+  if (scope_known) {
+    result.valid = true;
+    result.pending = m_refresh_scope_state.pending;
+    result.active = m_refresh_scope_state.active;
+    result.owner_scope = m_refresh_scope_state.kind;
+    result.epoch = m_refresh_scope_state.epoch;
+    if (m_refresh_scope_state.active && m_refresh_scope_state.enter_cycle >= 0 &&
+        m_timing_nrfc > 0) {
+      const Clk_t scope_blocked_until =
+          safe_add(m_refresh_scope_state.enter_cycle, m_timing_nrfc);
+      if (scope_blocked_until > clk) {
+        result.horizon_cycles =
+            static_cast<uint64_t>(scope_blocked_until - clk);
+      }
+    }
+  }
+
+  for (const auto& entry : m_bank_entries) {
+    const bool entry_known = entry.refresh_pending || entry.refreshing ||
+                             entry.refresh_recovery || entry.refresh_epoch != 0;
+    if (!entry_known) {
+      continue;
+    }
+
+    result.valid = true;
+    result.pending = result.pending || entry.refresh_pending;
+    result.active = result.active || entry.refreshing;
+    result.recovery = result.recovery || entry.refresh_recovery;
+    if (result.owner_scope == RefreshScopeKind::kNone &&
+        entry.refresh_owner_scope != RefreshScopeKind::kNone) {
+      result.owner_scope = entry.refresh_owner_scope;
+    }
+    result.epoch = std::max<uint64_t>(result.epoch, entry.refresh_epoch);
+    const Clk_t blocked_until =
+        std::max(entry.refresh_blocked_until, entry.recovery_blocked_until);
+    if (blocked_until > clk) {
+      result.horizon_cycles = std::max<uint64_t>(
+          result.horizon_cycles,
+          static_cast<uint64_t>(blocked_until - clk));
+    }
+  }
+
   return result;
 }
 
 bool BankStateScoreboard::is_command_ready(IDRAM* dram, int command,
                                            const AddrVec_t& addr_vec,
                                            Clk_t clk) const {
-  if (!m_valid) return false;
+  return evaluate_command_ready(dram, command, addr_vec, clk).ready;
+}
 
-  if (command == m_cmd_prea || command == m_cmd_refab) {
-    bool has_target = false;
-    bool ready = true;
-    for_each_target_rank_const(addr_vec,
-                               [&](const RankTimingEntry& rank_entry, int) {
-                                 has_target = true;
-                                 if (clk < rank_entry.refresh_active_until ||
-                                     clk < rank_entry.refresh_recovery_until) {
-                                   ready = false;
-                                   return;
-                                 }
-                                 if (command == m_cmd_prea &&
-                                     clk < rank_entry.next_prea_ready_at) {
-                                   ready = false;
-                                   return;
-                                 }
-                                 if (command == m_cmd_refab &&
-                                     clk < rank_entry.next_ref_ready_at) {
-                                   ready = false;
-                                 }
-                               });
-    if (!has_target || !ready) {
-      return false;
-    }
-    if (command == m_cmd_refab && any_open_row_in_scope(addr_vec)) {
-      return false;
-    }
-    return true;
+ForcedAutoprechargeDecision
+BankStateScoreboard::evaluate_forced_autoprecharge(
+    IDRAM* dram, const Request& req, const BankStateSnapshot& bank_state,
+    Clk_t clk, uint32_t autoprecharge_cap) const {
+  ForcedAutoprechargeDecision result {};
+  if (!m_valid || !dram) {
+    return result;
   }
 
-  const bool is_bank_local_tracked =
-      command == m_cmd_act || command == m_cmd_pre ||
-      is_read_like_command(command) || is_write_like_command(command);
-  if (!is_bank_local_tracked) {
-    return true;
+  result.valid = true;
+  if (autoprecharge_cap == 0) {
+    return result;
+  }
+  if (req.command != req.final_command) {
+    return result;
+  }
+  if (!bank_state.valid || !bank_state.row_hit) {
+    return result;
+  }
+  if (bank_state.refreshing || bank_state.refresh_recovery) {
+    return result;
   }
 
-  int rank = 0;
-  int bg = 0;
-  int bank = 0;
-  if (!lookup_bank_components(addr_vec, rank, bg, bank)) {
-    return false;
+  const auto cmd_meta = dram->m_command_meta(req.command);
+  if (!cmd_meta.is_accessing || cmd_meta.is_closing) {
+    return result;
   }
 
-  const BankStateEntry& entry = m_bank_entries[flatten_index(rank, bg, bank)];
-  const auto meta = dram->m_command_meta(command);
-
-  if (!meta.is_refreshing) {
-    if (clk < entry.refresh_blocked_until) return false;
-    if (clk < entry.recovery_blocked_until) return false;
+  if (bank_state.col_accesses_on_row + 1 <
+      static_cast<uint64_t>(autoprecharge_cap)) {
+    return result;
   }
 
-  const int row = addr_component(addr_vec, m_level_row);
-  if (command == m_cmd_act && entry.open_row_valid) {
-    return false;
-  }
-  if (is_read_like_command(command) || is_write_like_command(command)) {
-    if (!entry.open_row_valid) return false;
-    if (row < 0 || entry.open_row != row) return false;
-  }
-  if (command == m_cmd_pre && !entry.open_row_valid) {
-    return false;
+  if (req.type_id == Request::Type::Read && req.command == m_cmd_rd) {
+    result.issue_command = m_cmd_rda;
+  } else if (req.type_id == Request::Type::Write &&
+             req.command == m_cmd_wr) {
+    result.issue_command = m_cmd_wra;
+  } else {
+    return result;
   }
 
-  if (command == m_cmd_act) {
-    if (clk < m_layer_timing.next_act_ready_at) return false;
-    if (m_timing_nfaw > 0) {
-      size_t window_acts = 0;
-      for (const Clk_t act_clk : m_layer_timing.recent_act_cycles) {
-        if (safe_add(act_clk, m_timing_nfaw) > clk) {
-          window_acts++;
-        }
-      }
-      if (window_acts >= 4) return false;
-    }
-    return clk >= entry.next_act_ready_at;
-  }
-  if (command == m_cmd_pre) {
-    return clk >= entry.next_pre_ready_at;
-  }
-  if (is_read_like_command(command)) {
-    if (clk < m_layer_timing.next_col_issue_ready_at) return false;
-    if (clk < m_layer_timing.next_read_data_ready_at) return false;
-    if (clk < m_layer_timing.next_read_ready_at) return false;
-    return clk >= entry.next_read_ready_at;
-  }
-  if (is_write_like_command(command)) {
-    if (clk < m_layer_timing.next_col_issue_ready_at) return false;
-    if (clk < m_layer_timing.next_write_data_ready_at) return false;
-    if (clk < m_layer_timing.next_write_ready_at) return false;
-    return clk >= entry.next_write_ready_at;
+  if (result.issue_command < 0) {
+    return result;
   }
 
-  return true;
+  const ReadyResult ready =
+      evaluate_command_ready(dram, result.issue_command, req.addr_vec, clk);
+  result.block_reason = ready.block_reason;
+  result.force = ready.ready;
+  if (!result.force) {
+    result.issue_command = -1;
+  }
+  return result;
 }
 
 ShadowDiffResult BankStateScoreboard::diff_against_dram(
     IDRAM* dram, int final_command, const AddrVec_t& addr_vec) const {
   ShadowDiffResult result {};
-  const ProbeResult probe_result = probe(dram, final_command, addr_vec);
+  const ProbeResult probe_result =
+      probe_result_from_bank_state(snapshot_bank_state(addr_vec, 0));
   if (!probe_result.valid) {
     return result;
   }
@@ -792,6 +1137,47 @@ size_t BankStateScoreboard::count_refresh_pending_banks() const {
     if (entry.refresh_pending) count++;
   }
   return count;
+}
+
+size_t BankStateScoreboard::count_open_banks() const {
+  if (!m_valid) return 0;
+  size_t count = 0;
+  for (const auto& entry : m_bank_entries) {
+    if (entry.open_row_valid && !entry.refreshing) count++;
+  }
+  return count;
+}
+
+size_t BankStateScoreboard::count_inflight_banks() const {
+  if (!m_valid) return 0;
+  size_t count = 0;
+  for (const auto& entry : m_bank_entries) {
+    if (entry.inflight_accesses > 0) count++;
+  }
+  return count;
+}
+
+size_t BankStateScoreboard::count_autoprecharge_armed_banks() const {
+  if (!m_valid) return 0;
+  size_t count = 0;
+  for (const auto& entry : m_bank_entries) {
+    if (entry.autoprecharge_armed) count++;
+  }
+  return count;
+}
+
+uint64_t BankStateScoreboard::max_open_row_age_cycles(Clk_t clk) const {
+  if (!m_valid) return 0;
+  uint64_t max_age = 0;
+  for (const auto& entry : m_bank_entries) {
+    if (!entry.open_row_valid || entry.open_since_cycle < 0 ||
+        clk < entry.open_since_cycle) {
+      continue;
+    }
+    max_age =
+        std::max<uint64_t>(max_age, static_cast<uint64_t>(clk - entry.open_since_cycle));
+  }
+  return max_age;
 }
 
 }  // namespace Ramulator

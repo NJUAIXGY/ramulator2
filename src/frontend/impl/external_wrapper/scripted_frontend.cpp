@@ -65,6 +65,110 @@ ScriptTrafficClass parse_traffic_class(const YAML::Node& n) {
   return ScriptTrafficClass::kForeground;
 }
 
+int parse_op_class(const YAML::Node& n, bool is_write,
+                   ScriptTrafficClass traffic_class) {
+  if (n) {
+    try {
+      const int raw = n.as<int>();
+      switch (raw) {
+        case Request::OpClass::DemandRead:
+        case Request::OpClass::DemandWrite:
+        case Request::OpClass::BackgroundWriteback:
+        case Request::OpClass::ShadowSync:
+          return raw;
+        default:
+          break;
+      }
+    } catch (...) {
+    }
+
+    const std::string value = n.as<std::string>("");
+    if (value == "demand_read") return Request::OpClass::DemandRead;
+    if (value == "demand_write") return Request::OpClass::DemandWrite;
+    if (value == "background_writeback") {
+      return Request::OpClass::BackgroundWriteback;
+    }
+    if (value == "shadow_sync") return Request::OpClass::ShadowSync;
+  }
+
+  if (traffic_class == ScriptTrafficClass::kBackground) {
+    return Request::OpClass::BackgroundWriteback;
+  }
+  if (traffic_class == ScriptTrafficClass::kShadow) {
+    return Request::OpClass::ShadowSync;
+  }
+  return is_write ? Request::OpClass::DemandWrite
+                  : Request::OpClass::DemandRead;
+}
+
+int parse_target_kind(const YAML::Node& n, int op_class) {
+  if (n) {
+    try {
+      const int raw = n.as<int>();
+      if (raw == Request::TargetKind::Resident ||
+          raw == Request::TargetKind::Shadow) {
+        return raw;
+      }
+    } catch (...) {
+    }
+
+    const std::string value = n.as<std::string>("");
+    if (value == "resident" || value == "residential") {
+      return Request::TargetKind::Resident;
+    }
+    if (value == "shadow") return Request::TargetKind::Shadow;
+  }
+
+  return op_class == Request::OpClass::ShadowSync
+             ? Request::TargetKind::Shadow
+             : Request::TargetKind::Resident;
+}
+
+int parse_ordering_class(const YAML::Node& n,
+                         ScriptTrafficClass traffic_class) {
+  if (n) {
+    try {
+      const int raw = n.as<int>();
+      if (raw == Request::OrderingClass::ProgramOrder ||
+          raw == Request::OrderingClass::Relaxed) {
+        return raw;
+      }
+    } catch (...) {
+    }
+
+    const std::string value = n.as<std::string>("");
+    if (value == "program_order") {
+      return Request::OrderingClass::ProgramOrder;
+    }
+    if (value == "relaxed") return Request::OrderingClass::Relaxed;
+  }
+
+  return traffic_class == ScriptTrafficClass::kForeground
+             ? Request::OrderingClass::ProgramOrder
+             : Request::OrderingClass::Relaxed;
+}
+
+int parse_placement_state(const YAML::Node& n) {
+  if (!n) return Request::PlacementState::SingleResident;
+  try {
+    const int raw = n.as<int>();
+    switch (raw) {
+      case Request::PlacementState::SingleResident:
+      case Request::PlacementState::MultiResident:
+      case Request::PlacementState::ShadowResident:
+        return raw;
+      default:
+        return Request::PlacementState::SingleResident;
+    }
+  } catch (...) {
+  }
+
+  const std::string value = n.as<std::string>("");
+  if (value == "multi_resident") return Request::PlacementState::MultiResident;
+  if (value == "shadow_resident") return Request::PlacementState::ShadowResident;
+  return Request::PlacementState::SingleResident;
+}
+
 }  // namespace
 
 class Scripted : public IFrontEnd, public Implementation {
@@ -78,11 +182,19 @@ class Scripted : public IFrontEnd, public Implementation {
     uint32_t size = 0;
     uint64_t at = 0;
     int source_id = -1;
-    int path_class = Request::PathClass::Unknown;
-    int source_tier_hint = -1;
-    int destination_tier_hint = -1;
-    int tier_hint = -1;
+    int route_class = Request::PathClass::Unknown;
+    int src_exec_tier_hint = -1;
+    int dst_access_tier_hint = -1;
     ScriptTrafficClass traffic_class = ScriptTrafficClass::kForeground;
+    int op_class = Request::OpClass::Unknown;
+    int target_kind = Request::TargetKind::Unknown;
+    int ordering_class = Request::OrderingClass::Unknown;
+    int home_tier_hint = -1;
+    int resident_tier_hint = -1;
+    uint64_t shadow_tiers_mask = 0;
+    int placement_state = Request::PlacementState::SingleResident;
+    uint64_t placement_epoch = 0;
+    uint64_t data_version = 0;
   };
 
   enum class ExpectKind {
@@ -216,15 +328,56 @@ class Scripted : public IFrontEnd, public Implementation {
       const uint32_t size = n["size"].as<uint32_t>(0);
       const uint64_t at = n["at"].as<uint64_t>(0);
       const int source_id = n["source_id"].as<int>(-1);
-      const int path_class = parse_path_class(n["path_class"]);
-      const int source_tier_hint = n["source_tier_hint"].as<int>(-1);
-      const int destination_tier_hint =
-          n["destination_tier_hint"].as<int>(n["tier_hint"].as<int>(-1));
-      const int tier_hint = n["tier_hint"].as<int>(-1);
       const ScriptTrafficClass traffic_class = parse_traffic_class(n["traffic_class"]);
+      const int route_class =
+          n["route_class"] ? parse_path_class(n["route_class"])
+                           : parse_path_class(n["path_class"]);
+      const int src_exec_tier_hint =
+          n["src_exec_tier_hint"].as<int>(n["source_tier_hint"].as<int>(-1));
+      const int dst_access_tier_hint =
+          n["dst_access_tier_hint"].as<int>(
+              n["destination_tier_hint"].as<int>(n["tier_hint"].as<int>(-1)));
+      const int op_class =
+          parse_op_class(n["op_class"], is_write, traffic_class);
+      const int target_kind = parse_target_kind(n["target_kind"], op_class);
+      const int ordering_class =
+          parse_ordering_class(n["ordering_class"], traffic_class);
+      const int home_tier_hint =
+          n["home_tier"].as<int>(n["home_tier_hint"].as<int>(-1));
+      const int resident_tier_hint =
+          n["resident_tier"].as<int>(n["resident_tier_hint"].as<int>(
+              dst_access_tier_hint >= 0 ? dst_access_tier_hint : -1));
+      const uint64_t shadow_tiers_mask =
+          n["shadow_tiers_mask"]
+              ? parse_u64(n["shadow_tiers_mask"], "shadow_tiers_mask")
+              : 0;
+      const int placement_state =
+          parse_placement_state(n["placement_state"]);
+      const uint64_t placement_epoch =
+          n["placement_epoch"]
+              ? parse_u64(n["placement_epoch"], "placement_epoch")
+              : 0;
+      const uint64_t data_version =
+          n["data_version"] ? parse_u64(n["data_version"], "data_version") : 0;
       m_script.push_back(
-          {is_write, (Addr_t)addr_u64, size, at, source_id, path_class,
-           source_tier_hint, destination_tier_hint, tier_hint, traffic_class});
+          {is_write,
+           (Addr_t)addr_u64,
+           size,
+           at,
+           source_id,
+           route_class,
+           src_exec_tier_hint,
+           dst_access_tier_hint,
+           traffic_class,
+           op_class,
+           target_kind,
+           ordering_class,
+           home_tier_hint,
+           resident_tier_hint,
+           shadow_tiers_mask,
+           placement_state,
+           placement_epoch,
+           data_version});
     }
 
     m_sent.assign(m_script.size(), false);
@@ -276,11 +429,23 @@ class Scripted : public IFrontEnd, public Implementation {
                   r.is_write ? Request::Type::Write : Request::Type::Read,
                   r.source_id, cb);
       req.request_size_bytes = r.size;
-      req.path_class = r.path_class;
-      req.source_tier_hint = r.source_tier_hint;
-      req.destination_tier_hint =
-          r.destination_tier_hint >= 0 ? r.destination_tier_hint : r.tier_hint;
+      req.path_class = r.route_class;
+      req.route_class = r.route_class;
+      req.source_tier_hint = r.src_exec_tier_hint;
+      req.src_exec_tier_hint = r.src_exec_tier_hint;
+      req.destination_tier_hint = r.dst_access_tier_hint;
+      req.dst_access_tier_hint = r.dst_access_tier_hint;
       req.tier_hint = req.destination_tier_hint;
+      req.op_class = r.op_class;
+      req.target_kind = r.target_kind;
+      req.ordering_class = r.ordering_class;
+      req.home_tier_hint =
+          r.home_tier_hint >= 0 ? r.home_tier_hint : r.resident_tier_hint;
+      req.resident_tier_hint = r.resident_tier_hint;
+      req.shadow_tiers_mask = r.shadow_tiers_mask;
+      req.placement_state = r.placement_state;
+      req.placement_epoch = r.placement_epoch;
+      req.data_version = r.data_version;
       req.scratchpad[kShmemTrafficClassScratchpadIdx] =
           static_cast<int>(r.traffic_class);
       bool ok = m_memory_system->send(req);

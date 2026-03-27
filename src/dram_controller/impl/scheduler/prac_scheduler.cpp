@@ -78,9 +78,17 @@ public:
 
         Clk_t next_recovery = m_prac->next_recovery_cycle();
         for (auto& req : buffer) {
-            req.command = m_ctrl->get_prereq_command(req.final_command, req.addr_vec);
+            ControllerCommandState command_state {};
+            if (m_ctrl->query_command_state(req.final_command, req.addr_vec,
+                                            command_state)) {
+                req.command = command_state.next_command;
+                req.scratchpad[READY_IDX] =
+                    command_state.next_command_ready ? 1 : 0;
+            } else {
+                req.command = -1;
+                req.scratchpad[READY_IDX] = 0;
+            }
             req.scratchpad[FITS_IDX] = m_clk + m_prac->min_cycles_with_preall(req) < next_recovery;
-            req.scratchpad[READY_IDX] = m_ctrl->is_command_ready(req.command, req.addr_vec);
         }
 
         auto candidate = buffer.begin();

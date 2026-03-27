@@ -161,8 +161,13 @@ class AutoPrechargePolicy : public IRowPolicy, public Implementation {
 
     // Recompute the preq command so the controller issues RDA/WRA when ready.
     req_it->final_command = new_final;
-    req_it->command =
-        m_ctrl->get_prereq_command(req_it->final_command, req_it->addr_vec);
+    ControllerCommandState command_state {};
+    if (m_ctrl->query_command_state(req_it->final_command, req_it->addr_vec,
+                                    command_state)) {
+      req_it->command = command_state.next_command;
+    } else {
+      req_it->command = -1;
+    }
   };
 };
 
@@ -299,7 +304,11 @@ class CapAutoPrechargePolicy : public IRowPolicy, public Implementation {
           if (new_final != -1) {
             // Apply only if RDA/WRA is directly ready; otherwise keep RD/WR
             // and try again later (avoid invalidating scheduler readiness).
-            if (m_ctrl->is_command_ready(new_final, req_it->addr_vec)) {
+            ControllerCommandState command_state {};
+            if (m_ctrl->query_command_state(new_final, req_it->addr_vec,
+                                            command_state) &&
+                command_state.next_command == new_final &&
+                command_state.next_command_ready) {
               req_it->final_command = new_final;
               req_it->command = new_final;
               m_accesses[flat] = 0;  // auto-precharge closes the row

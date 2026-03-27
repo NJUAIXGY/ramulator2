@@ -6,6 +6,10 @@
 
 namespace Ramulator {
 
+namespace {
+constexpr int kReadyScratchpadIdx = 0;
+}
+
 class FRFCFS : public IScheduler, public Implementation {
   RAMULATOR_REGISTER_IMPLEMENTATION(IScheduler, FRFCFS, "FRFCFS", "FRFCFS DRAM Scheduler.")
   private:
@@ -19,8 +23,8 @@ class FRFCFS : public IScheduler, public Implementation {
     };
 
     ReqBuffer::iterator compare(ReqBuffer::iterator req1, ReqBuffer::iterator req2) override {
-      bool ready1 = m_ctrl->is_command_ready(req1->command, req1->addr_vec);
-      bool ready2 = m_ctrl->is_command_ready(req2->command, req2->addr_vec);
+      bool ready1 = req1->scratchpad[kReadyScratchpadIdx] != 0;
+      bool ready2 = req2->scratchpad[kReadyScratchpadIdx] != 0;
 
       if (ready1 ^ ready2) {
         if (ready1) {
@@ -44,7 +48,16 @@ class FRFCFS : public IScheduler, public Implementation {
       }
 
       for (auto& req : buffer) {
-        req.command = m_ctrl->get_prereq_command(req.final_command, req.addr_vec);
+        ControllerCommandState command_state {};
+        if (m_ctrl->query_command_state(req.final_command, req.addr_vec,
+                                        command_state)) {
+          req.command = command_state.next_command;
+          req.scratchpad[kReadyScratchpadIdx] =
+              command_state.next_command_ready ? 1 : 0;
+        } else {
+          req.command = -1;
+          req.scratchpad[kReadyScratchpadIdx] = 0;
+        }
       }
 
       auto candidate = buffer.begin();
