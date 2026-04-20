@@ -16,7 +16,9 @@ namespace Ramulator {
 namespace {
 
 constexpr int kShmemTrafficClassScratchpadIdx = 4;
+constexpr int kShmemPhaseIdScratchpadIdx = 9;
 constexpr size_t kNumExternalTrafficClasses = 3;
+constexpr size_t kNumShmemPhases = 3;
 
 enum class ExternalTrafficClass : int {
   kForeground = 0,
@@ -61,6 +63,13 @@ const char* traffic_class_stat_prefix(ExternalTrafficClass traffic_class) {
 
 bool is_valid_source_id(const Request& req, size_t num_cores) {
   return req.source_id >= 0 && static_cast<size_t>(req.source_id) < num_cores;
+}
+
+size_t shmem_phase_index(const Request& req) {
+  const int raw = req.scratchpad[kShmemPhaseIdScratchpadIdx];
+  if (raw <= 0) return 0;
+  if (raw == 1) return 1;
+  return kNumShmemPhases - 1;
 }
 
 ControllerRefreshScope controller_refresh_scope_from_scoreboard(
@@ -223,6 +232,20 @@ class TieredM3DController final : public IDRAMController, public Implementation 
   size_t s_write_row_hits = 0;
   size_t s_write_row_misses = 0;
   size_t s_write_row_conflicts = 0;
+
+  std::array<size_t, kNumShmemPhases> s_phase_row_hits = {0, 0, 0};
+  std::array<size_t, kNumShmemPhases> s_phase_row_misses = {0, 0, 0};
+  std::array<size_t, kNumShmemPhases> s_phase_row_conflicts = {0, 0, 0};
+
+  TrafficClassCounterArray s_row_hits_by_class = {0, 0, 0};
+  TrafficClassCounterArray s_row_misses_by_class = {0, 0, 0};
+  TrafficClassCounterArray s_row_conflicts_by_class = {0, 0, 0};
+  TrafficClassCounterArray s_read_row_hits_by_class = {0, 0, 0};
+  TrafficClassCounterArray s_read_row_misses_by_class = {0, 0, 0};
+  TrafficClassCounterArray s_read_row_conflicts_by_class = {0, 0, 0};
+  TrafficClassCounterArray s_write_row_hits_by_class = {0, 0, 0};
+  TrafficClassCounterArray s_write_row_misses_by_class = {0, 0, 0};
+  TrafficClassCounterArray s_write_row_conflicts_by_class = {0, 0, 0};
 
   size_t m_num_cores = 0;
   std::vector<size_t> s_read_row_hits_per_core;
@@ -591,6 +614,14 @@ class TieredM3DController final : public IDRAMController, public Implementation 
     register_stat(s_write_row_misses).name("write_row_misses_{}", m_channel_id);
     register_stat(s_write_row_conflicts)
         .name("write_row_conflicts_{}", m_channel_id);
+    for (size_t phase = 0; phase < kNumShmemPhases; ++phase) {
+      register_stat(s_phase_row_hits[phase])
+          .name("phase{}_row_hits_{}", phase, m_channel_id);
+      register_stat(s_phase_row_misses[phase])
+          .name("phase{}_row_misses_{}", phase, m_channel_id);
+      register_stat(s_phase_row_conflicts[phase])
+          .name("phase{}_row_conflicts_{}", phase, m_channel_id);
+    }
 
     for (size_t core_id = 0; core_id < m_num_cores; core_id++) {
       register_stat(s_read_row_hits_per_core[core_id])
@@ -652,6 +683,24 @@ class TieredM3DController final : public IDRAMController, public Implementation 
     for (const auto traffic_class : kTrafficClasses) {
       const size_t idx = traffic_class_index(traffic_class);
       const char* prefix = traffic_class_stat_prefix(traffic_class);
+      register_stat(s_row_hits_by_class[idx])
+          .name("{}_row_hits_{}", prefix, m_channel_id);
+      register_stat(s_row_misses_by_class[idx])
+          .name("{}_row_misses_{}", prefix, m_channel_id);
+      register_stat(s_row_conflicts_by_class[idx])
+          .name("{}_row_conflicts_{}", prefix, m_channel_id);
+      register_stat(s_read_row_hits_by_class[idx])
+          .name("{}_read_row_hits_{}", prefix, m_channel_id);
+      register_stat(s_read_row_misses_by_class[idx])
+          .name("{}_read_row_misses_{}", prefix, m_channel_id);
+      register_stat(s_read_row_conflicts_by_class[idx])
+          .name("{}_read_row_conflicts_{}", prefix, m_channel_id);
+      register_stat(s_write_row_hits_by_class[idx])
+          .name("{}_write_row_hits_{}", prefix, m_channel_id);
+      register_stat(s_write_row_misses_by_class[idx])
+          .name("{}_write_row_misses_{}", prefix, m_channel_id);
+      register_stat(s_write_row_conflicts_by_class[idx])
+          .name("{}_write_row_conflicts_{}", prefix, m_channel_id);
       register_stat(s_queue_len_by_class[idx])
           .name("{}_queue_len_{}", prefix, m_channel_id);
       register_stat(s_queue_len_avg_by_class[idx])
@@ -1087,15 +1136,31 @@ class TieredM3DController final : public IDRAMController, public Implementation 
     result.row_hits = static_cast<uint64_t>(s_row_hits);
     result.row_misses = static_cast<uint64_t>(s_row_misses);
     result.row_conflicts = static_cast<uint64_t>(s_row_conflicts);
-    result.foreground_row_hits = 0;
-    result.foreground_row_misses = 0;
-    result.foreground_row_conflicts = 0;
-    result.background_row_hits = 0;
-    result.background_row_misses = 0;
-    result.background_row_conflicts = 0;
-    result.shadow_row_hits = 0;
-    result.shadow_row_misses = 0;
-    result.shadow_row_conflicts = 0;
+    result.foreground_row_hits = static_cast<uint64_t>(
+        s_row_hits_by_class[traffic_class_index(
+            ExternalTrafficClass::kForeground)]);
+    result.foreground_row_misses = static_cast<uint64_t>(
+        s_row_misses_by_class[traffic_class_index(
+            ExternalTrafficClass::kForeground)]);
+    result.foreground_row_conflicts = static_cast<uint64_t>(
+        s_row_conflicts_by_class[traffic_class_index(
+            ExternalTrafficClass::kForeground)]);
+    result.background_row_hits = static_cast<uint64_t>(
+        s_row_hits_by_class[traffic_class_index(
+            ExternalTrafficClass::kBackground)]);
+    result.background_row_misses = static_cast<uint64_t>(
+        s_row_misses_by_class[traffic_class_index(
+            ExternalTrafficClass::kBackground)]);
+    result.background_row_conflicts = static_cast<uint64_t>(
+        s_row_conflicts_by_class[traffic_class_index(
+            ExternalTrafficClass::kBackground)]);
+    result.shadow_row_hits = static_cast<uint64_t>(
+        s_row_hits_by_class[traffic_class_index(ExternalTrafficClass::kShadow)]);
+    result.shadow_row_misses = static_cast<uint64_t>(s_row_misses_by_class[
+        traffic_class_index(ExternalTrafficClass::kShadow)]);
+    result.shadow_row_conflicts = static_cast<uint64_t>(
+        s_row_conflicts_by_class[traffic_class_index(
+            ExternalTrafficClass::kShadow)]);
 
     result.local_accesses =
         static_cast<uint64_t>(s_tier_local_read_reqs + s_tier_local_write_reqs);
@@ -1568,23 +1633,33 @@ class TieredM3DController final : public IDRAMController, public Implementation 
         resolve_row_state_for_stats(req->final_command, req->addr_vec);
     const bool row_hit = probe.row_hit;
     const bool row_open = (!row_hit && probe.row_open);
+    const size_t phase_idx = shmem_phase_index(*req);
 
     if (req->type_id == Request::Type::Read) {
       if (row_hit) {
         s_read_row_hits++;
         s_row_hits++;
+        s_phase_row_hits[phase_idx]++;
+        s_read_row_hits_by_class[traffic_idx]++;
+        s_row_hits_by_class[traffic_idx]++;
         if (is_valid_source_id(*req, m_num_cores)) {
           s_read_row_hits_per_core[req->source_id]++;
         }
       } else if (row_open) {
         s_read_row_conflicts++;
         s_row_conflicts++;
+        s_phase_row_conflicts[phase_idx]++;
+        s_read_row_conflicts_by_class[traffic_idx]++;
+        s_row_conflicts_by_class[traffic_idx]++;
         if (is_valid_source_id(*req, m_num_cores)) {
           s_read_row_conflicts_per_core[req->source_id]++;
         }
       } else {
         s_read_row_misses++;
         s_row_misses++;
+        s_phase_row_misses[phase_idx]++;
+        s_read_row_misses_by_class[traffic_idx]++;
+        s_row_misses_by_class[traffic_idx]++;
         if (is_valid_source_id(*req, m_num_cores)) {
           s_read_row_misses_per_core[req->source_id]++;
         }
@@ -1593,12 +1668,21 @@ class TieredM3DController final : public IDRAMController, public Implementation 
       if (row_hit) {
         s_write_row_hits++;
         s_row_hits++;
+        s_phase_row_hits[phase_idx]++;
+        s_write_row_hits_by_class[traffic_idx]++;
+        s_row_hits_by_class[traffic_idx]++;
       } else if (row_open) {
         s_write_row_conflicts++;
         s_row_conflicts++;
+        s_phase_row_conflicts[phase_idx]++;
+        s_write_row_conflicts_by_class[traffic_idx]++;
+        s_row_conflicts_by_class[traffic_idx]++;
       } else {
         s_write_row_misses++;
         s_row_misses++;
+        s_phase_row_misses[phase_idx]++;
+        s_write_row_misses_by_class[traffic_idx]++;
+        s_row_misses_by_class[traffic_idx]++;
       }
     }
   }
