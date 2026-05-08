@@ -1,4 +1,5 @@
 #include "dram_controller/controller.h"
+#include "dram_controller/bank_machine.h"
 #include "dram_controller/bank_state_scoreboard.h"
 #include "memory_system/memory_system.h"
 
@@ -221,6 +222,12 @@ class TieredM3DController final : public IDRAMController, public Implementation 
   bool m_shadow_scoreboard_fail_fast = false;
   bool m_shadow_scoreboard_log_mismatch = false;
   BankStateScoreboard m_shadow_scoreboard;
+  BankMachine m_bank_machine;
+  uint32_t m_scoreboard_autoprecharge_cap = 0;
+  int m_cmd_rd = -1;
+  int m_cmd_wr = -1;
+  int m_cmd_rda = -1;
+  int m_cmd_wra = -1;
   Clk_t m_refresh_window_cycles = -1;
 
   size_t s_row_hits = 0;
@@ -349,6 +356,7 @@ class TieredM3DController final : public IDRAMController, public Implementation 
   size_t s_shadow_scoreboard_ready_mismatch_other = 0;
   size_t s_shadow_scoreboard_ready_blocked_by_scoreboard = 0;
   size_t s_shadow_scoreboard_ready_blocked_by_oracle = 0;
+  size_t s_scoreboard_forced_autoprecharge = 0;
 
  public:
   void init() override {
@@ -529,6 +537,12 @@ class TieredM3DController final : public IDRAMController, public Implementation 
             .desc(
                 "Log mismatches between controller scoreboard and optional DRAM-oracle debug overlay.")
             .default_val(false);
+    m_scoreboard_autoprecharge_cap =
+        param<uint32_t>("scoreboard_autoprecharge_cap")
+            .desc(
+                "When >0, force RDA/WRA in controller once a row reaches this many accesses "
+                "according to shadow scoreboard (0 disables controller-side cap policy).")
+            .default_val(0);
 
     // Queue depths: keep defaults small for legacy behavior, but allow YAML to
     // scale buffers so the controller (not the injector) becomes the bottleneck.
@@ -581,6 +595,25 @@ class TieredM3DController final : public IDRAMController, public Implementation 
     if (m_shadow_scoreboard_enable) {
       m_shadow_scoreboard.init_from_dram_org(m_dram, m_channel_id);
     }
+    m_bank_machine.setup(m_dram);
+    m_bank_machine.attach_scoreboard(
+        controller_scoreboard_enabled() ? &m_shadow_scoreboard : nullptr);
+    if (m_scoreboard_autoprecharge_cap > 0) {
+      try {
+        m_cmd_rd = m_dram->m_commands("RD");
+        m_cmd_wr = m_dram->m_commands("WR");
+        m_cmd_rda = m_dram->m_commands("RDA");
+        m_cmd_wra = m_dram->m_commands("WRA");
+      } catch (const std::out_of_range&) {
+        spdlog::warn(
+            "TieredM3D channel {}: disable scoreboard_autoprecharge_cap={} "
+            "because DRAM does not expose RD/WR/RDA/WRA.",
+            m_channel_id, m_scoreboard_autoprecharge_cap);
+        m_scoreboard_autoprecharge_cap = 0;
+      }
+    }
+    m_bank_machine.configure_scoreboard_autoprecharge(
+        m_scoreboard_autoprecharge_cap, m_cmd_rd, m_cmd_wr, m_cmd_rda, m_cmd_wra);
     m_refresh_window_cycles = detect_refresh_window_cycles();
 
     m_num_cores = frontend->get_num_cores();
@@ -854,6 +887,8 @@ class TieredM3DController final : public IDRAMController, public Implementation 
         .name("shadow_scoreboard_ready_blocked_by_scoreboard_{}", m_channel_id);
     register_stat(s_shadow_scoreboard_ready_blocked_by_oracle)
         .name("shadow_scoreboard_ready_blocked_by_oracle_{}", m_channel_id);
+    register_stat(s_scoreboard_forced_autoprecharge)
+        .name("scoreboard_forced_autoprecharge_{}", m_channel_id);
   };
 
   bool send(Request& req) override {
@@ -1231,8 +1266,15 @@ class TieredM3DController final : public IDRAMController, public Implementation 
 
       const ExternalTrafficClass issued_traffic_class =
           get_external_traffic_class(*req_it);
-      const int command = req_it->command;
+      const SchedulingState issue_state =
+          resolve_scheduling_state(req_it->final_command, req_it->addr_vec);
+      BankMachine::IssuePlan issue_plan =
+          m_bank_machine.build_issue_plan(*req_it, issue_state, m_clk);
+      const int command = issue_plan.issue_command;
       m_dram->issue_command(command, req_it->addr_vec);
+      if (issue_plan.forced_autoprecharge) {
+        s_scoreboard_forced_autoprecharge++;
+      }
       if (controller_scoreboard_enabled()) {
         m_shadow_scoreboard.on_issue_command(m_dram, command, req_it->addr_vec,
                                              m_clk);
@@ -1293,7 +1335,7 @@ class TieredM3DController final : public IDRAMController, public Implementation 
         }
       }
 
-      if (command == req_it->final_command) {
+      if (issue_plan.completes_request) {
         Request completed_req = *req_it;
         completed_req.depart = completion_depart_cycle(completed_req);
         move_request_to_pending(completed_req, buffer);
