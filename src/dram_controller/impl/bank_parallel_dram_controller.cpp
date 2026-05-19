@@ -21,6 +21,7 @@ constexpr int kShmemTrafficClassScratchpadIdx = 4;
 constexpr int kShmemPhaseIdScratchpadIdx = 9;
 constexpr size_t kNumExternalTrafficClasses = 3;
 constexpr size_t kNumShmemPhases = 3;
+constexpr size_t kRowBufferEventRingCapacity = 4096;
 
 enum class ExternalTrafficClass : int {
   kForeground = 0,
@@ -222,6 +223,7 @@ class BankParallelDRAMController final : public IDRAMController,
   int m_cmd_wr = -1;
   int m_cmd_rda = -1;
   int m_cmd_wra = -1;
+  std::deque<ControllerRowBufferEvent> m_rowbuffer_event_ring;
 
   size_t s_row_hits = 0;
   size_t s_row_misses = 0;
@@ -1046,6 +1048,25 @@ class BankParallelDRAMController final : public IDRAMController,
     return true;
   }
 
+  bool consume_rowbuffer_event(uint64_t addr, const AddrVec_t& addr_vec,
+                               int type_id, int source_id,
+                               ControllerRowBufferEvent& result) override {
+    result = ControllerRowBufferEvent {};
+    for (auto it = m_rowbuffer_event_ring.begin();
+         it != m_rowbuffer_event_ring.end(); ++it) {
+      if (!it->valid || it->type_id != type_id || it->source_id != source_id) {
+        continue;
+      }
+      if (it->addr != addr && it->addr_vec != addr_vec) {
+        continue;
+      }
+      result = *it;
+      m_rowbuffer_event_ring.erase(it);
+      return true;
+    }
+    return false;
+  }
+
   void tick() override {
     m_clk++;
     m_last_ready_block_reason = ControllerReadyBlockReason::kNone;
@@ -1614,7 +1635,25 @@ class BankParallelDRAMController final : public IDRAMController,
     const ProbeResult probe = probe_row_state(req);
     const bool row_hit = probe.row_hit;
     const bool row_open = (!row_hit && probe.row_open);
+    const int rowbuffer_state = row_hit ? 1 : (row_open ? 2 : 0);
     const size_t phase_idx = shmem_phase_index(*req);
+    req->rowbuffer_event_valid = true;
+    req->rowbuffer_event_state = rowbuffer_state;
+
+    ControllerRowBufferEvent event {};
+    event.valid = true;
+    event.addr = static_cast<uint64_t>(req->addr);
+    event.type_id = req->type_id;
+    event.source_id = req->source_id;
+    event.final_command = req->final_command;
+    event.rowbuffer_state = rowbuffer_state;
+    event.clk = static_cast<uint64_t>(m_clk);
+    event.addr_vec = req->addr_vec;
+    event.scratchpad = req->scratchpad;
+    m_rowbuffer_event_ring.push_back(event);
+    while (m_rowbuffer_event_ring.size() > kRowBufferEventRingCapacity) {
+      m_rowbuffer_event_ring.pop_front();
+    }
 
     if (req->type_id == Request::Type::Read) {
       if (row_hit) {

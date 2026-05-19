@@ -200,6 +200,18 @@ struct ControllerTelemetryObservationSampleV1 {
   uint64_t vertical_copy_accesses = 0;
 };
 
+struct ControllerRowBufferEvent {
+  bool valid = false;
+  uint64_t addr = 0;
+  int type_id = -1;
+  int source_id = -1;
+  int final_command = -1;
+  int rowbuffer_state = 0;
+  uint64_t clk = 0;
+  AddrVec_t addr_vec {};
+  std::array<int, 12> scratchpad = {0};
+};
+
 class IDRAMController : public Clocked<IDRAMController> {
   RAMULATOR_REGISTER_INTERFACE(IDRAMController, "Controller", "Memory Controller Interface");
 
@@ -320,6 +332,18 @@ class IDRAMController : public Clocked<IDRAMController> {
     virtual bool query_telemetry_observation_sample_v1(
         ControllerTelemetryObservationSampleV1& result) const {
       result = ControllerTelemetryObservationSampleV1 {};
+      return false;
+    }
+
+    virtual bool consume_rowbuffer_event(uint64_t addr,
+                                         const AddrVec_t& addr_vec,
+                                         int type_id, int source_id,
+                                         ControllerRowBufferEvent& result) {
+      (void)addr;
+      (void)addr_vec;
+      (void)type_id;
+      (void)source_id;
+      result = ControllerRowBufferEvent {};
       return false;
     }
    
