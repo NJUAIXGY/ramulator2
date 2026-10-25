@@ -13,6 +13,9 @@ import ramulator
 import tests.controller_scheduling.harness as cs
 
 DRAMS = [
+    ("hbm1", ramulator.dram.HBM1,
+     dict(org_preset="HBM1_4Gb", timing_preset="HBM1_1Gbps"),
+     cs.ControllerUnderTest.make_hbm12),
     ("hbm2", ramulator.dram.HBM2,
      dict(org_preset="HBM2_2Gb", timing_preset="HBM2_2000Mbps"),
      cs.ControllerUnderTest.make_hbm12),
